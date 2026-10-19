@@ -1,0 +1,61 @@
+{
+  "name": "dsh-local-browser-web",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: local-browser web_search + web_fetch providers on the ctx.web seam, with an extensible search-engine registry, a four-stage fetch cleaning pipeline, a quality-filter layer, and a graphical settings section.",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/**/*.d.ts",
+    "README.md",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-api-remotes": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-locale": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-web": "^0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "dependencies": {
+    "jsdom": "^29.1.1",
+    "turndown": "^7.2.4"
+  },
+  "scripts": {
+    "setup": "node scripts/setup-links.mjs",
+    "typecheck": "node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "build": "node node_modules/typescript/bin/tsc -p tsconfig.build.json && node node_modules/tsdown/dist/run.mjs",
+    "build:host": "node node_modules/typescript/bin/tsc -p tsconfig.build.json",
+    "build:client": "node node_modules/tsdown/dist/run.mjs",
+    "test": "node --experimental-transform-types --test tests/*.test.ts"
+  }
+}

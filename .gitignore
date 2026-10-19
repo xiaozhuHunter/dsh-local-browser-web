@@ -1,0 +1,11 @@
+# node_modules and build output
+node_modules/
+lib/
+*.tsbuildinfo
+
+# local operational artifacts (profile backups taken before mounting, agent planning docs)
+.backup/
+.trae/
+
+# editor / OS noise
+.DS_Store

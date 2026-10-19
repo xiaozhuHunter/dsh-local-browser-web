@@ -1,0 +1,28 @@
+# The dsh-local-browser-web mount patch. NOT applied to the live profile during
+# development — see README "安装". Copy or point `dsh web --patch <this file>` at
+# a throwaway profile to try it out.
+#
+# Two things are patched:
+#   1. `insert` — the plugin row itself (profile entry id `local-browser-web`).
+#   2. `id: web` — the ctx.web seam row, pinned to this plugin's providers. Both
+#      providers must be pinned here (or from the settings panel) because a
+#      registered-but-unselected second provider makes the seam throw
+#      WEB_PROVIDER_AMBIGUOUS.
+#
+# A patch replaces the targeted row's whole `config`, so the `web` row restates
+# every key it owns (searchProvider / fetchProvider only).
+
+- insert:
+    - id: local-browser-web
+      name: 'dsh-local-browser-web'
+      config:
+        searchProvider: local-browser-search
+        fetchProvider: local-browser-fetch
+        dispatchMode: bail
+        fetchBackend: cdp
+        cdpEndpoint: 'http://127.0.0.1:9222'
+
+- id: web
+  config:
+    searchProvider: local-browser-search
+    fetchProvider: local-browser-fetch

@@ -1,0 +1,16 @@
+{
+  // Host-half build: emit only this plugin's sources to lib/. Peer deps stay
+  // bare specifiers (rewriteRelativeImportExtensions turns `./x.ts` into
+  // `./x.js`), so the runtime resolver in the DSH profile finds them.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": "src",
+    "outDir": "lib"
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}
