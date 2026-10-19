@@ -1,6 +1,6 @@
 # dsh-local-browser-web
 
-一个 DeepSeek Harness（DSH）插件：用**本机浏览器**（CDP，可选 Playwright）为 `ctx.web` 能力接缝提供 `web_search` 与 `web_fetch` provider，并补齐内置远程 API 之外的**可扩展引擎注册表**、**四阶段清洗管线**、**质量过滤层**与**图形化设置页**。
+一个 DeepSeek Harness（DSH）插件：用**本机浏览器**（CDP，可选 Playwright）为 `ctx.web` 能力接缝提供 搜索`web_search` 与 抓取`web_fetch` provider，并补齐内置远程 API 之外的**可扩展引擎注册表**、**四阶段清洗管线**、**质量过滤层**与**图形化设置页**。
 
 - 搜索 provider id：`local-browser-search`
 - 抓取 provider id：`local-browser-fetch`
