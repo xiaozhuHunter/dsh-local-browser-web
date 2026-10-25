@@ -23,11 +23,17 @@ export interface PlaywrightOptions {
   profileMode: ProfileMode
   userAgent: string
   timeoutMs: number
+  /** Outbound proxy for the rendered page: `scheme://host:port` plus a bypass list. */
+  proxy?: { server: string, bypass: string }
 }
+
+/** The proxy shape Playwright's launch/context options accept. */
+type PlaywrightProxy = { server: string, bypass?: string }
 
 /** The slice of Playwright's API this backend uses, declared structurally so no types are required. */
 interface PlaywrightPage {
   goto(url: string, options: { timeout: number, waitUntil: string }): Promise<{ status(): number } | null>
+  waitForSelector(selector: string, options: { timeout: number, state: string }): Promise<unknown>
   content(): Promise<string>
   url(): string
   close(): Promise<void>
@@ -39,18 +45,21 @@ interface PlaywrightContext {
 }
 
 interface PlaywrightBrowserInstance {
-  newContext(options: { userAgent: string }): Promise<PlaywrightContext>
+  newContext(options: { userAgent?: string, proxy?: PlaywrightProxy }): Promise<PlaywrightContext>
   close(): Promise<void>
 }
 
 interface PlaywrightChromium {
-  launch(options: { executablePath?: string, headless: boolean }): Promise<PlaywrightBrowserInstance>
-  launchPersistentContext(userDataDir: string, options: { executablePath?: string, headless: boolean, userAgent: string }): Promise<PlaywrightContext>
+  launch(options: { executablePath?: string, headless: boolean, proxy?: PlaywrightProxy }): Promise<PlaywrightBrowserInstance>
+  launchPersistentContext(userDataDir: string, options: { executablePath?: string, headless: boolean, userAgent?: string, proxy?: PlaywrightProxy }): Promise<PlaywrightContext>
 }
 
 interface PlaywrightModule {
   chromium: PlaywrightChromium
 }
+
+/** How long Playwright waits for a parser-declared selector before reading anyway. */
+const PLAYWRIGHT_SELECTOR_MS = 8_000
 
 /** Derive the profile-dir name Playwright's persistent context reuses between runs. */
 function profileDirOf(mode: ProfileMode): string {
@@ -101,7 +110,7 @@ export class PlaywrightBrowser {
    * @returns final URL, HTTP status, and rendered HTML.
    * @throws {LocalBrowserWebError} `BROWSER_UNAVAILABLE` / `WEB_FETCH_TIMEOUT`.
    */
-  async render(url: string, signal?: AbortSignal): Promise<RenderedPage> {
+  async render(url: string, signal?: AbortSignal, waitFor?: readonly string[]): Promise<RenderedPage> {
     const module = this.loaded ?? await this.load()
     if (module === undefined) {
       throw new LocalBrowserWebError(
@@ -110,7 +119,14 @@ export class PlaywrightBrowser {
       )
     }
     const options = this.options()
-    const launch = { headless: true, ...options.browserPath === undefined ? {} : { executablePath: options.browserPath } }
+    const proxy: PlaywrightProxy | undefined = options.proxy === undefined
+      ? undefined
+      : { server: options.proxy.server, ...options.proxy.bypass.length === 0 ? {} : { bypass: options.proxy.bypass } }
+    const launch = {
+      headless: true,
+      ...options.browserPath === undefined ? {} : { executablePath: options.browserPath },
+      ...proxy === undefined ? {} : { proxy },
+    }
     let context: PlaywrightContext | undefined
     let browser: PlaywrightBrowserInstance | undefined
     let emitContext = false
@@ -118,11 +134,14 @@ export class PlaywrightBrowser {
       if (options.profileMode === 'shared') {
         context = await module.chromium.launchPersistentContext(profileDirOf(options.profileMode), {
           ...launch,
-          userAgent: options.userAgent,
+          ...options.userAgent.length > 0 ? { userAgent: options.userAgent } : {},
         })
       } else {
         browser = await module.chromium.launch(launch)
-        context = await browser.newContext({ userAgent: options.userAgent })
+        context = await browser.newContext({
+          ...options.userAgent.length > 0 ? { userAgent: options.userAgent } : {},
+          ...proxy === undefined ? {} : { proxy },
+        })
         emitContext = true
       }
       const page = await context.newPage()
@@ -137,6 +156,12 @@ export class PlaywrightBrowser {
       const timer = setTimeout(() => { void abort() }, options.timeoutMs)
       try {
         const response = await page.goto(url, { timeout: options.timeoutMs, waitUntil: 'domcontentloaded' })
+        // `domcontentloaded` fires before a client-rendered SERP injects its list;
+        // the parser's own selector is the only reliable readiness signal.
+        if (waitFor !== undefined && waitFor.length > 0) {
+          await Promise.any(waitFor.map(selector => page.waitForSelector(selector, { timeout: PLAYWRIGHT_SELECTOR_MS, state: 'attached' })))
+            .catch(() => undefined)
+        }
         const html = await page.content()
         return {
           url: page.url(),

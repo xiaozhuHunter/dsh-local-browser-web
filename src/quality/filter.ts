@@ -1,37 +1,59 @@
 /**
  * The quality-filter layer: what separates this plugin from "just fetch the page".
  *
- * Five rule families run over extracted content:
- *   1. thin content            — too little substance to be a result
- *   2. SEO spam                — keyword stuffing and repeated boilerplate
- *   3. low-quality AIGC        — machine-written filler markers
- *   4. domain reputation       — user-maintained allow/block lists
- *   5. authority signals       — the cheap structural hints a real article carries
+ * The score is built from evidence about the **publisher**, not from words that
+ * happen to appear in the text:
  *
- * Two behaviours matter more than the rules themselves:
+ *   tier base  +  primary/secondary  +  freshness  -  deception  -  content spam
  *
- * - **Nothing is dropped silently.** The seam's `WebSearchSource` / `WebFetchResult`
- *   shapes are closed (`dsh-web` owns them), so a verdict cannot ride the result
- *   object. Instead every verdict is recorded in the plugin's diagnostics ring
- *   (readable by the `local_search_test` tool) and in the structured log line for
- *   the operation. Results are *ranked* by score, never removed.
+ * Why the redesign: the previous version counted English authority words
+ * (`author`, `byline`, `citation`). Measured against a real SERP it produced two
+ * distinct scores for ten results, awarded full marks to a keyword-stuffed
+ * sentence (`source source source …`), and flagged every Chinese article as
+ * low-authority because the hint list was English-only. See
+ * `quality/source-tiers.ts` for the replacement.
+ *
+ * Three behaviours matter more than the rules themselves:
+ *
+ * - **Nothing is dropped silently.** The seam's `WebSearchSource` /
+ *   `WebFetchResult` shapes are closed (`dsh-web` owns them), so a verdict cannot
+ *   ride the result object. Verdicts go to the diagnostics ring (readable by
+ *   `local_search_test`) and to the structured log line; ranking is the only
+ *   thing the score changes. The reader-facing material is separate and lives in
+ *   the `summary` annotation (see `providers/search.ts`).
  * - **Every rule is individually switchable**, and the whole layer has a master
- *   bypass, because debugging an extraction is impossible when the filter decides
- *   what you may see.
+ *   bypass, because debugging an extraction is impossible when the filter
+ *   decides what you may see.
+ * - **The context decides the thresholds.** A 120-character search snippet is a
+ *   complete value, not thin content; a 120-character article is not.
  *
  * @module dsh-local-browser-web/quality/filter
  */
 import type { ResolvedConfig } from '../config.ts'
 import type { QualityVerdict, RawSearchSource } from '../types.ts'
+import {
+  daysSince,
+  isShortLink,
+  looksLikeSpoof,
+  looksSecondary,
+  tierOf,
+} from './source-tiers.ts'
 
 /** The quality rule set, as resolved from config. */
 export type QualityRules = ResolvedConfig['quality']
+
+/** Which surface is being judged — it selects the thin-content floor. */
+export type QualityContext = 'search' | 'fetch'
 
 /** One text to judge. */
 export interface QualityInput {
   text: string
   url: string
   title?: string | undefined
+  /** Provider-supplied publication date, when the engine gave one. */
+  publishedAt?: string | undefined
+  /** `search` for a snippet, `fetch` for an extracted article. Defaults to `fetch`. */
+  context?: QualityContext
 }
 
 /** Filler phrases that mark machine-written padding. Lowercased. */
@@ -41,9 +63,6 @@ const AIGC_MARKERS = [
   "in today's fast-paced world", 'delve into', 'rich tapestry', 'furthermore, it',
   'when it comes to', 'navigating the complexities',
 ]
-
-/** Structural hints that a page is a real article rather than an aggregator stub. */
-const AUTHORITY_HINTS = ['author', 'byline', 'published', 'updated', 'date', 'citation', 'reference', 'source']
 
 /** Split text into non-empty paragraphs. */
 function paragraphsOf(text: string): string[] {
@@ -89,12 +108,6 @@ function aigcMarkerRatio(text: string): number {
   return marked / sentences.length
 }
 
-/** Count authority hints present in the text. */
-function authorityHits(text: string): number {
-  const lower = text.toLowerCase()
-  return AUTHORITY_HINTS.filter(hint => lower.includes(hint)).length
-}
-
 /** The hostname of a URL, or empty when it does not parse. */
 function hostOf(url: string): string {
   try {
@@ -111,22 +124,34 @@ function hostMatches(host: string, entry: string): boolean {
   return host === needle || host.endsWith(`.${needle}`)
 }
 
+/** The scheme of a URL, lowercase, without the colon. */
+function schemeOf(url: string): string {
+  try {
+    return new URL(url).protocol.replace(':', '').toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
 /**
  * Judge one document.
  *
- * @param input - the text, its URL, and its title.
+ * @param input - the text, its URL, title, publication date, and which surface asked.
  * @param rules - the resolved quality rules.
  * @returns score (0–100) and the flags that fired, in rule order.
  */
 export function evaluateQuality(input: QualityInput, rules: QualityRules): QualityVerdict {
-  const flags: string[] = []
-  let score = 100
-  if (!rules.enabled) return { score, flags }
+  if (!rules.enabled) return { score: 100, flags: [] }
 
+  const flags: string[] = []
+  const context: QualityContext = input.context ?? 'fetch'
   const host = hostOf(input.url)
+  const { tier, base } = tierOf(input.url)
+  let score = base
+
+  // ── publisher reputation ────────────────────────────────────────────────
   const allowlisted = rules.domainReputation.enabled
     && rules.domainReputation.allowlist.some(entry => hostMatches(host, entry))
-
   if (rules.domainReputation.enabled && !allowlisted) {
     if (rules.domainReputation.blocklist.some(entry => hostMatches(host, entry))) {
       flags.push('domain-blocklisted')
@@ -138,22 +163,81 @@ export function evaluateQuality(input: QualityInput, rules: QualityRules): Quali
     score += 5
   }
 
-  const text = input.text.trim()
-  const words = wordsOf(text)
-  const paragraphs = paragraphsOf(text)
+  // ── primary vs secondary ────────────────────────────────────────────────
+  // A government notice is first-hand by default; the same tier relayed from
+  // someone else's report is not, and an anonymous page can never be primary.
+  const primaryTier = tier === 'official' || tier === 'academic' || tier === 'project' || tier === 'press'
+  const secondary = looksSecondary(input.text)
+  let authority = base
+  if (primaryTier) {
+    if (secondary) {
+      authority -= 6
+      flags.push('secondary-source')
+    } else {
+      authority += 6
+      flags.push('primary-source')
+    }
+  } else if (secondary) {
+    authority -= 6
+    flags.push('secondary-source')
+  }
 
-  if (rules.thinContent.enabled && text.length < rules.thinContent.minChars) {
+  // ── freshness ───────────────────────────────────────────────────────────
+  if (rules.freshness.enabled) {
+    const age = daysSince(input.publishedAt)
+    if (age === undefined) {
+      // A snippet legitimately carries no date; an article without one is a gap.
+      if (context === 'fetch') {
+        authority -= 4
+        flags.push('undated')
+      }
+    } else if (age > rules.freshness.staleDays) {
+      authority -= 8
+      flags.push('stale')
+    } else if (age <= 30) {
+      authority += 8
+      flags.push('fresh')
+    } else if (age <= 180) {
+      authority += 2
+    }
+  }
+
+  // ── deception signals ───────────────────────────────────────────────────
+  const scheme = schemeOf(input.url)
+  if (scheme.length > 0 && scheme !== 'https') {
+    score -= 5
+    flags.push('insecure')
+  }
+  if (isShortLink(input.url)) {
+    score -= 3
+    flags.push('shortlink')
+  }
+  if (looksLikeSpoof(input.url)) {
+    score -= 40
+    flags.push('possible-spoof')
+  }
+
+  if (rules.authority.enabled && authority < rules.authority.minScore) {
+    flags.push('low-authority')
+    score -= 20
+  }
+  score += authority - base
+
+  // ── content shape ───────────────────────────────────────────────────────
+  const text = input.text.trim()
+  const floor = context === 'search' ? rules.snippetMinChars : rules.thinContent.minChars
+  if (rules.thinContent.enabled && text.length < floor) {
     flags.push('thin-content')
     score -= 45
   }
   if (rules.seoSpam.enabled && !allowlisted) {
-    const density = topWordRatio(words)
-    const duplicates = duplicateRatio(paragraphs)
-    if (words.length >= 50 && density > rules.seoSpam.maxKeywordDensity) {
+    const words = wordsOf(text)
+    const paragraphs = paragraphsOf(text)
+    if (words.length >= 50 && topWordRatio(words) > rules.seoSpam.maxKeywordDensity) {
       flags.push('seo-keyword-stuffing')
       score -= 30
     }
-    if (paragraphs.length >= 4 && duplicates > rules.seoSpam.maxDuplicateRatio) {
+    if (paragraphs.length >= 4 && duplicateRatio(paragraphs) > rules.seoSpam.maxDuplicateRatio) {
       flags.push('seo-duplicate-boilerplate')
       score -= 25
     }
@@ -162,14 +246,6 @@ export function evaluateQuality(input: QualityInput, rules: QualityRules): Quali
     if (aigcMarkerRatio(text) > rules.lowQualityAigc.maxAigcMarkerRatio) {
       flags.push('low-quality-aigc')
       score -= 25
-    }
-  }
-  if (rules.authority.enabled) {
-    const hits = authorityHits(text)
-    const authority = Math.min(100, hits * 20 + (input.title !== undefined && input.title.length > 0 ? 20 : 0))
-    if (authority < rules.authority.minScore) {
-      flags.push('low-authority')
-      score -= 20
     }
   }
 
@@ -186,9 +262,8 @@ export interface RankedSource {
  * Judge and order search sources.
  *
  * Sources are ordered by descending score (stable for ties, so engine ordering
- * still decides equal scores), and every source is kept: `quality_score` /
- * `quality_flags` are reported through diagnostics rather than by deleting rows
- * the caller never learns about.
+ * still decides equal scores), and every source is kept: the score orders what
+ * the reader sees, it never deletes a row they would never learn about.
  *
  * @param sources - the merged sources from dispatch.
  * @param rules - the resolved quality rules.
@@ -203,7 +278,16 @@ export function rankSources(
   return sources
     .map((source, index) => ({
       source,
-      quality: evaluateQuality({ text: textOf(source), url: source.url, title: source.title }, rules),
+      quality: evaluateQuality(
+        {
+          text: textOf(source),
+          url: source.url,
+          title: source.title,
+          publishedAt: source.publishedAt,
+          context: 'search',
+        },
+        rules,
+      ),
       index,
     }))
     .sort((left, right) => right.quality.score - left.quality.score || left.index - right.index)

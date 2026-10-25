@@ -61,6 +61,15 @@ export interface EngineSpec {
   enabledByDefault: boolean
   /** Whether the engine currently participates in dispatch. */
   enabled: boolean
+  /**
+   * Regex source matching result URLs that are click trackers, not destinations.
+   *
+   * Google stopped exposing real hrefs (`/goto?url=<opaque token>`), so the only
+   * way back to the destination is to follow one redirect hop. An engine that
+   * declares this pattern gets that hop resolved per result; leaving it out means
+   * "every URL the parser produces is already the destination".
+   */
+  unwrapRedirect?: string
   /** Engine-specific parameters (region, language, safe search, JSON field paths). */
   extraParams?: EngineExtraParams
 }
@@ -114,7 +123,19 @@ export interface ParserInput {
  * plugins register more strategies through the plugin's public service instead of
  * editing this package.
  */
-export type ResultParser = (input: ParserInput) => RawSearchSource[]
+export type ResultParser = ((input: ParserInput) => RawSearchSource[]) & {
+  /**
+   * Selectors the strategy needs before the DOM is worth reading.
+   *
+   * A client-rendered SERP (Google, DuckDuckGo) ships an empty shell first and
+   * injects the result list a beat later, so `loadEventFired` can fire while
+   * `#rso` still has zero children. Declaring the selector here keeps that
+   * knowledge with the strategy that depends on it — the runners stay generic and
+   * no new execution path appears. A rendered backend waits for **any** of these
+   * to match, then proceeds regardless on timeout.
+   */
+  waitFor?: readonly string[]
+}
 
 /** A raw retrieval handed back by a fetch backend. */
 export interface BackendFetchResult {
@@ -138,6 +159,8 @@ export interface BackendFetchRequest {
   maxBytes: number
   /** Whether the backend should execute the page's JavaScript before reading the DOM. */
   render: boolean
+  /** Selectors a rendering backend waits for before reading the DOM; first match wins. */
+  waitFor?: readonly string[]
   signal?: AbortSignal
 }
 

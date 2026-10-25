@@ -14,7 +14,10 @@ import type { RunnerContext } from '../engines/runners/context.ts'
 import type { EngineRegistry } from '../engines/registry.ts'
 import { LocalBrowserWebError } from '../errors.ts'
 import type { Diagnostics } from '../log.ts'
+import type { ConflictNote } from '../quality/conflict.ts'
+import { detectConflicts } from '../quality/conflict.ts'
 import { rankSources, type RankedSource } from '../quality/filter.ts'
+import { TIER_LABELS, tierOf } from '../quality/source-tiers.ts'
 import type { QualityVerdict, RawSearchSource } from '../types.ts'
 
 /** What the provider reads per operation. */
@@ -38,13 +41,75 @@ function aggregateVerdict(ranked: readonly RankedSource[]): QualityVerdict {
 }
 
 /** Project a raw source into the seam's shape, omitting absent optionals. */
-function toSeamSource(source: RawSearchSource): WebSearchSource {
+function toSeamSource(source: RawSearchSource, summary: string | undefined): WebSearchSource {
   return {
     url: source.url,
     ...source.title === undefined ? {} : { title: source.title },
     ...source.snippet === undefined ? {} : { snippet: source.snippet },
+    ...summary === undefined ? {} : { summary },
     ...source.publishedAt === undefined ? {} : { publishedAt: source.publishedAt },
   }
+}
+
+/** A provider date short enough to read: epoch millis become an ISO day. */
+function dateLabelOf(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const text = value.trim()
+  if (text.length === 0) return undefined
+  if (/^\d{10}$/u.test(text) || /^\d{13}$/u.test(text)) {
+    const millis = text.length === 10 ? Number(text) * 1000 : Number(text)
+    const date = new Date(millis)
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString().slice(0, 10)
+  }
+  return text.length <= 24 ? text : text.slice(0, 24)
+}
+
+/**
+ * Build the reader-facing annotation for one source.
+ *
+ * This is the "备料" half of source vetting: the seam's source shape is closed, so
+ * the evidence about *where* the text came from rides `summary`, which
+ * `dsh-tool-web` renders in preference to the raw snippet. The model then sees
+ * the publisher class, whether the page is first-hand, how old it is, and any
+ * contradiction with a sibling source — without a second model, and without
+ * spending a token to compute it.
+ *
+ * @param source - the source being annotated.
+ * @param quality - its verdict, whose flags carry the primary/fresh labels.
+ * @param conflict - a contradiction found against another source, when any.
+ * @returns the annotation text, or `undefined` when there is nothing to say.
+ */
+export function annotationOf(
+  source: RawSearchSource,
+  quality: QualityVerdict,
+  conflict: ConflictNote | undefined,
+): string | undefined {
+  const parts: string[] = []
+  const label = TIER_LABELS[tierOf(source.url).tier]
+  if (label.length > 0) parts.push(label)
+  if (quality.flags.includes('primary-source')) parts.push('一手')
+  else if (quality.flags.includes('secondary-source')) parts.push('二手')
+  const date = dateLabelOf(source.publishedAt)
+  if (date !== undefined && date.length > 0) parts.push(date)
+  if (conflict !== undefined) parts.push(`与 ${conflict.otherHost} 分歧：${conflict.mine} vs ${conflict.theirs}`)
+  return parts.length === 0 ? undefined : `〔${parts.join('·')}〕`
+}
+
+/**
+ * `dsh-tool-web` caps a summary at 800 characters. That cap is outside this
+ * plugin, so the snippet is bounded here first — otherwise a long snippet would
+ * push the annotation past the cap and the evidence would be silently dropped,
+ * which is the one thing this annotation exists to prevent.
+ */
+const SNIPPET_HEAD_CHARS = 600
+
+/** Attach the annotation to the snippet the model will read. */
+export function withAnnotation(source: RawSearchSource, annotation: string | undefined): string | undefined {
+  if (annotation === undefined) return undefined
+  const snippet = source.snippet?.trim() ?? ''
+  if (snippet.length === 0) return annotation
+  const head = snippet.length <= SNIPPET_HEAD_CHARS ? snippet : `${snippet.slice(0, SNIPPET_HEAD_CHARS)}…`
+  return `${head} ${annotation}`
 }
 
 /** Local-browser search over the extensible engine registry. */
@@ -86,6 +151,9 @@ export class LocalBrowserSearchProvider implements WebSearchProvider {
         signal,
       )
       const ranked = rankSources(outcome.sources, config.quality)
+      const conflicts = config.quality.conflict.enabled
+        ? detectConflicts(outcome.sources)
+        : new Map<string, ConflictNote>()
       this.deps.diagnostics.record({
         at: Date.now(),
         kind: 'search',
@@ -109,7 +177,15 @@ export class LocalBrowserSearchProvider implements WebSearchProvider {
           })
         }
       }
-      return { sources: ranked.map(({ source }) => toSeamSource(source)), truncated: false }
+      return {
+        sources: ranked.map(({ source, quality }) => toSeamSource(
+          source,
+          config.quality.annotate.enabled
+            ? withAnnotation(source, annotationOf(source, quality, conflicts.get(source.url)))
+            : undefined,
+        )),
+        truncated: false,
+      }
     } catch (error) {
       this.deps.diagnostics.record({
         at: Date.now(),

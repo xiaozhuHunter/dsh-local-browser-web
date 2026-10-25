@@ -16,6 +16,7 @@
  * @module dsh-local-browser-web/browser/cdp
  */
 import { LocalBrowserWebError } from '../errors.ts'
+import { shouldBypass } from '../proxy.ts'
 import type { ProfileMode } from '../types.ts'
 
 /** One rendered page, as the plugin consumes it. */
@@ -35,6 +36,15 @@ export interface CdpOptions {
   profileMode: ProfileMode
   /** Per-render budget. */
   timeoutMs: number
+  /**
+   * Outbound proxy for the rendered page, as `scheme://host:port`.
+   *
+   * Chrome has no browser-wide proxy command, so this is applied by creating a
+   * browser context and passing the proxy to `Target.createBrowserContext` — the
+   * same mechanism Playwright uses. A proxied render therefore always runs in a
+   * fresh context, even in `shared` mode.
+   */
+  proxy?: { server: string, bypass: string }
 }
 
 /** A JSON-RPC style message from the browser. */
@@ -46,8 +56,7 @@ interface CdpMessage {
   error?: { message?: string, code?: number }
 }
 
-/** Time a promise settles, aborting it on timeout or caller cancellation. */
-async function within<T>(
+/** Time a promise settles, aborting it on timeout or caller cancellation. */async function within<T>(
   run: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   outer: AbortSignal | undefined,
@@ -63,8 +72,35 @@ async function within<T>(
   }
 }
 
-/** One WebSocket speaking CDP, with a pending-request table. */
-class CdpConnection {
+/**
+ * How long a render waits for `loadEventFired` before reading what is already there.
+ *
+ * A proxied page can keep a third-party asset open forever, so `readyState` stays
+ * `loading` and the event never arrives; spending the whole per-render budget on it
+ * would throw away a document that is already readable.
+ */
+const PAGE_LOAD_GRACE_MS = 8_000
+
+/** How long a render waits for a parser-declared selector before giving up and reading anyway. */
+const SELECTOR_READY_MS = 8_000
+
+/** Poll interval while waiting for that selector. */
+const SELECTOR_POLL_MS = 200
+
+/** Resolve `true` when `promise` settles first, `false` when the timer wins. */
+async function settlesFirst(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => { resolve(false) }, ms)
+  })
+  try {
+    return await Promise.race([promise.then(() => true, () => true), expired])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** One WebSocket speaking CDP, with a pending-request table. */class CdpConnection {
   private next = 1
   private readonly pending = new Map<number, { resolve: (value: Record<string, unknown>) => void, reject: (error: Error) => void }>()
   private readonly listeners = new Set<(message: CdpMessage) => void>()
@@ -206,10 +242,11 @@ export class CdpBrowser {
    * Render one URL in the browser and read its DOM.
    * @param url - the page to load.
    * @param signal - caller cancellation.
+   * @param waitFor - selectors a parser needs before the DOM is read (any match wins).
    * @returns final URL, main-document status, and rendered HTML.
    * @throws {LocalBrowserWebError} `BROWSER_UNAVAILABLE` / `WEB_FETCH_TIMEOUT`.
    */
-  async render(url: string, signal?: AbortSignal): Promise<RenderedPage> {
+  async render(url: string, signal?: AbortSignal, waitFor?: readonly string[]): Promise<RenderedPage> {
     const options = this.options()
     const endpoint = options.endpoint
     const browserVersion = await this.resolveVersion(endpoint, signal)
@@ -219,8 +256,17 @@ export class CdpBrowser {
       let contextId: string | undefined
       let targetId: string | undefined
       try {
-        if (options.profileMode === 'isolated') {
-          const created = await browser.send('Target.createBrowserContext', {}, inner)
+        // A proxy is per-context, so it forces a context even in `shared` mode.
+        // Cookies do not survive that, which is the trade-off the panel documents:
+        // a proxied render starts logged out. A target on the bypass list is *not*
+        // proxied, so it keeps the shared profile — and the logins in it — instead
+        // of paying that cost for nothing.
+        const proxied = options.proxy !== undefined
+          && !shouldBypass(new URL(url).hostname, options.proxy.bypass.split(',').map(entry => entry.trim()).filter(entry => entry.length > 0))
+        if (options.profileMode === 'isolated' || proxied) {
+          const created = await browser.send('Target.createBrowserContext', options.proxy === undefined || !proxied
+            ? {}
+            : { proxyServer: options.proxy.server, proxyBypassList: options.proxy.bypass }, inner)
           contextId = typeof created['browserContextId'] === 'string' ? created['browserContextId'] : undefined
         }
         const created = await browser.send('Target.createTarget', {
@@ -234,7 +280,12 @@ export class CdpBrowser {
         try {
           await page.send('Page.enable', {}, inner)
           await page.send('Network.enable', {}, inner)
-          await page.send('Network.setUserAgentOverride', { userAgent: options.userAgent }, inner)
+          // No override by default: the driven Chrome already presents the UA that
+          // matches its own version, and an unfamiliar UA makes engines serve a
+          // degraded, script-less page that renders to zero results.
+          if (options.userAgent.length > 0) {
+            await page.send('Network.setUserAgentOverride', { userAgent: options.userAgent }, inner)
+          }
 
           let statusCode = 0
           const seen = page.on((message) => {
@@ -256,7 +307,11 @@ export class CdpBrowser {
             )
           }
           void frameId
-          await loaded
+          // Bound the load wait, then let the parser's own selectors decide when the
+          // document is worth reading: a client-rendered SERP injects its list after
+          // `loadEventFired`, so reading on the event alone yields an empty shell.
+          await settlesFirst(loaded, PAGE_LOAD_GRACE_MS)
+          if (waitFor !== undefined && waitFor.length > 0) await this.waitForSelectors(page, waitFor, inner)
           // Reading the DOM after load catches client-rendered result lists.
           await page.send('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }, inner)
           const evaluated = await page.send('Runtime.evaluate', {
@@ -281,6 +336,26 @@ export class CdpBrowser {
       `local-browser-web: CDP 渲染超时（${String(options.timeoutMs)}ms，${url}）`,
       'WEB_FETCH_TIMEOUT',
     ))
+  }
+
+  /**
+   * Poll the live document until one of `selectors` matches.
+   *
+   * Waiting is best-effort: on timeout the caller reads whatever the DOM holds,
+   * because a page that rendered slowly is still worth parsing.
+   */
+  private async waitForSelectors(page: CdpConnection, selectors: readonly string[], signal: AbortSignal): Promise<void> {
+    const expression = `${JSON.stringify(selectors)}.some((selector) => document.querySelector(selector) !== null)`
+    const deadline = Date.now() + SELECTOR_READY_MS
+    while (Date.now() < deadline) {
+      try {
+        const probe = await page.send('Runtime.evaluate', { expression, returnByValue: true }, signal)
+        if (Reflect.get(Reflect.get(probe, 'result') ?? {}, 'value') === true) return
+      } catch (error) {
+        if (signal.aborted) throw error
+      }
+      await new Promise((resolve) => { setTimeout(resolve, SELECTOR_POLL_MS) })
+    }
   }
 
   /** Resolve the browser-level WebSocket URL from `/json/version`. */

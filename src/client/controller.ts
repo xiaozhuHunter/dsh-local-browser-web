@@ -89,6 +89,16 @@ export const FIELD_GROUPS: readonly { readonly titleKey: PanelLocaleKey, readonl
     ],
   },
   {
+    titleKey: 'groupProxy',
+    fields: [
+      { path: ['proxy', 'enabled'], kind: 'boolean', id: 'proxyEnabled', labelKey: 'proxyEnabled', hintKey: 'proxyEnabledHint' },
+      { path: ['proxy', 'url'], kind: 'text', id: 'proxyUrl', labelKey: 'proxyUrl', hintKey: 'proxyUrlHint' },
+      { path: ['proxy', 'bypass'], kind: 'text', id: 'proxyBypass', labelKey: 'proxyBypass', hintKey: 'proxyBypassHint' },
+      { path: ['proxy', 'http'], kind: 'boolean', id: 'proxyHttp', labelKey: 'proxyHttp', hintKey: 'proxyHttpHint' },
+      { path: ['proxy', 'browser'], kind: 'boolean', id: 'proxyBrowser', labelKey: 'proxyBrowser', hintKey: 'proxyBrowserHint' },
+    ],
+  },
+  {
     titleKey: 'groupClean',
     fields: [
       { path: ['clean', 'transport', 'enabled'], kind: 'boolean', id: 'cleanTransport', labelKey: 'cleanTransport', hintKey: 'cleanTransportHint' },
@@ -105,6 +115,7 @@ export const FIELD_GROUPS: readonly { readonly titleKey: PanelLocaleKey, readonl
       { path: ['quality', 'enabled'], kind: 'boolean', id: 'qualityEnabled', labelKey: 'qualityEnabled', hintKey: 'qualityEnabledHint' },
       { path: ['quality', 'thinContent', 'enabled'], kind: 'boolean', id: 'qThinEnabled', labelKey: 'qualityThin', hintKey: 'qualityThinHint' },
       { path: ['quality', 'thinContent', 'minChars'], kind: 'number', id: 'qThinMinChars', labelKey: 'qualityThinMinChars', hintKey: 'qualityThinMinCharsHint' },
+      { path: ['quality', 'snippetMinChars'], kind: 'number', id: 'qSnippetMinChars', labelKey: 'qualitySnippetMinChars', hintKey: 'qualitySnippetMinCharsHint' },
       { path: ['quality', 'seoSpam', 'enabled'], kind: 'boolean', id: 'qSeoEnabled', labelKey: 'qualitySeo', hintKey: 'qualitySeoHint' },
       { path: ['quality', 'seoSpam', 'maxKeywordDensity'], kind: 'number', id: 'qSeoDensity', labelKey: 'qualitySeoDensity', hintKey: 'qualitySeoDensityHint' },
       { path: ['quality', 'seoSpam', 'maxDuplicateRatio'], kind: 'number', id: 'qSeoDuplicate', labelKey: 'qualitySeoDuplicate', hintKey: 'qualitySeoDuplicateHint' },
@@ -115,6 +126,10 @@ export const FIELD_GROUPS: readonly { readonly titleKey: PanelLocaleKey, readonl
       { path: ['quality', 'domainReputation', 'allowlist'], kind: 'lines', id: 'qAllowlist', labelKey: 'qualityAllowlist', hintKey: 'qualityAllowlistHint' },
       { path: ['quality', 'authority', 'enabled'], kind: 'boolean', id: 'qAuthorityEnabled', labelKey: 'qualityAuthority', hintKey: 'qualityAuthorityHint' },
       { path: ['quality', 'authority', 'minScore'], kind: 'number', id: 'qAuthorityMin', labelKey: 'qualityAuthorityMin', hintKey: 'qualityAuthorityMinHint' },
+      { path: ['quality', 'freshness', 'enabled'], kind: 'boolean', id: 'qFreshEnabled', labelKey: 'qualityFreshness', hintKey: 'qualityFreshnessHint' },
+      { path: ['quality', 'freshness', 'staleDays'], kind: 'number', id: 'qFreshStaleDays', labelKey: 'qualityStaleDays', hintKey: 'qualityStaleDaysHint' },
+      { path: ['quality', 'conflict', 'enabled'], kind: 'boolean', id: 'qConflictEnabled', labelKey: 'qualityConflict', hintKey: 'qualityConflictHint' },
+      { path: ['quality', 'annotate', 'enabled'], kind: 'boolean', id: 'qAnnotateEnabled', labelKey: 'qualityAnnotate', hintKey: 'qualityAnnotateHint' },
     ],
   },
   {

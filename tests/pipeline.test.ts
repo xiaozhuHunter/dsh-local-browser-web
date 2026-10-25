@@ -120,6 +120,36 @@ describe('runFetchPipeline', () => {
     assert.equal(outcome.backend, 'http')
   })
 
+  it('caps the cleaned output, not the markup the extractor needs', async () => {
+    // A document far larger than the cap must still be extracted whole: the cap
+    // is a context budget, so it applies to the Markdown, not to the DOM.
+    const config = makeConfig({ fetchBackend: 'cdp', maxBodyChars: 400 })
+    const outcome = await runFetchPipeline('https://news.test/story', config, registryWith('cdp', htmlResult))
+    assert.equal(outcome.body.content.length, 400)
+    assert.equal(outcome.truncated, true)
+    assert.equal(outcome.chars, 400)
+  })
+
+  it('continues as text when extraction refuses the markup', async () => {
+    // 2 000 nested tags exceed the ceiling in extractArticle: the pipeline must
+    // hand on the degraded text instead of the markup that was just refused.
+    const depth = 2_000
+    const bomb = `<body>${'<div>'.repeat(depth)}survivor${'</div>'.repeat(depth)}</body>`
+    const outcome = await runFetchPipeline(
+      'https://news.test/bomb',
+      makeConfig({ fetchBackend: 'cdp' }),
+      registryWith('cdp', {
+        url: 'https://news.test/bomb',
+        statusCode: 200,
+        body: bomb,
+        contentType: 'text/html',
+        truncated: false,
+      }),
+    )
+    assert.equal(outcome.body.kind, 'text')
+    assert.equal(outcome.body.content, 'survivor')
+  })
+
   it('bypasses the quality layer when its stage is switched off', async () => {
     const config = makeConfig({ fetchBackend: 'cdp' })
     config.clean.quality = false

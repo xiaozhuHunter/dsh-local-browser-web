@@ -10,6 +10,7 @@
  */
 import { LocalBrowserWebError } from '../../errors.ts'
 import { httpGet } from '../../http.ts'
+import { httpProxyOf } from '../../proxy.ts'
 import { buildSearchUrl, searchLimits, type EngineRunner } from './context.ts'
 
 /** Query one JSON search API. */
@@ -36,6 +37,7 @@ export const apiRunner: EngineRunner = async (engine, query, ctx, signal) => {
     url: url.toString(),
     headers,
     limits: searchLimits(config),
+    proxy: httpProxyOf(config.proxy),
     ...signal === undefined ? {} : { signal },
   })
   return ctx.parsers.parse(engine.resultParser, {

@@ -9,6 +9,7 @@
  * @module dsh-local-browser-web/http
  */
 import { LocalBrowserWebError } from './errors.ts'
+import { proxyFetch, type ProxySpec } from './proxy.ts'
 
 /** Resource limits applied to one retrieval. */
 export interface HttpLimits {
@@ -32,6 +33,8 @@ export interface HttpResult {
   /** Lowercased content type without parameters (`text/html`). */
   contentType: string
   truncated: boolean
+  /** `Location` of an unfollowed redirect; present only with `followRedirects: false`. */
+  location?: string
 }
 
 /** How the pipeline classifies a content type. */
@@ -113,6 +116,48 @@ export function classifyContentType(contentType: string): ContentKind {
   return 'unsupported'
 }
 
+/** The charset a `Content-Type` header declares, lower-cased. */
+function headerCharset(rawContentType: string): string | undefined {
+  const match = /;\s*charset\s*=\s*"?([^";]+)"?/iu.exec(rawContentType)
+  return match?.[1]?.trim().toLowerCase()
+}
+
+/**
+ * The charset the page declares about itself, for hosts that omit it from the
+ * header. Legacy Chinese sites ship `charset=gb2312` in `<meta>` only; decoding
+ * those bytes as UTF-8 turns every Chinese character into a replacement mark.
+ *
+ * @param bytes - the response body (only the head is inspected).
+ * @returns the declared label, lower-cased, when the document names one.
+ */
+function metaCharset(bytes: Uint8Array): string | undefined {
+  const head = new TextDecoder('latin1').decode(bytes.subarray(0, 4_096)).toLowerCase()
+  const direct = /<meta[^>]+charset\s*=\s*["']?([\w-]+)/u.exec(head)
+  if (direct?.[1] !== undefined) return direct[1]
+  const equiv = /<meta[^>]+content\s*=\s*["'][^"']*charset\s*=\s*([\w-]+)/u.exec(head)
+  return equiv?.[1]
+}
+
+/**
+ * Decode a response body with its declared charset.
+ *
+ * The header wins over the document, the document over UTF-8 — the same
+ * precedence a browser uses. An unrecognised label falls back to UTF-8 rather
+ * than failing the fetch: `fatal: false` never throws on real-world bytes.
+ *
+ * @param bytes - the capped response body.
+ * @param rawContentType - the raw `Content-Type` header, parameters included.
+ * @returns the decoded text.
+ */
+export function decodeBody(bytes: Uint8Array, rawContentType: string): string {
+  const label = headerCharset(rawContentType) ?? metaCharset(bytes) ?? 'utf-8'
+  try {
+    return new TextDecoder(label, { fatal: false }).decode(bytes)
+  } catch {
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+  }
+}
+
 /**
  * Detect an anti-bot / challenge interstitial.
  *
@@ -142,6 +187,21 @@ export interface HttpRequest {
   headers?: Record<string, string>
   limits: HttpLimits
   signal?: AbortSignal
+  /**
+   * Outbound proxy, when one is configured and this path uses it.
+   *
+   * Absent means a direct connection — which is also what a proxy bypass entry
+   * resolves to, since {@link proxyFetch} re-checks the list per target.
+   */
+  proxy?: ProxySpec
+  /**
+   * Whether a 3xx is followed to its destination (default true).
+   *
+   * Set `false` to read one hop's `Location` instead — which is how a click
+   * tracker (`google.com/goto?url=…`) is turned back into a real URL without
+   * downloading the page it points at.
+   */
+  followRedirects?: boolean
 }
 
 /**
@@ -160,21 +220,27 @@ export async function httpGet(request: HttpRequest): Promise<HttpResult> {
     : AbortSignal.any([controller.signal, request.signal])
   try {
     let target = assertFetchableUrl(request.url)
+    const headers: Record<string, string> = {
+      'user-agent': limits.userAgent,
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      ...request.headers,
+    }
+    // One send per hop, so a redirect chain keeps whichever egress it started on.
+    // Both branches answer with a `Response`, which is what lets the caps and
+    // content-type checks below stay transport-agnostic.
+    const send = async (url: URL): Promise<Response> => request.proxy === undefined
+      ? await fetch(url, { redirect: 'manual', signal, headers })
+      : await proxyFetch(url, { spec: request.proxy, headers, signal })
     let hops = 0
     let response: Response
     for (;;) {
-      const attempt = await fetch(target, {
-        redirect: 'manual',
-        signal,
-        headers: {
-          'user-agent': limits.userAgent,
-          'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          ...request.headers,
-        },
-      })
+      const attempt = await send(target)
       const location = attempt.headers.get('location')
       if (attempt.status >= 300 && attempt.status < 400 && location !== null) {
+        if (request.followRedirects === false) {
+          return { url: target.toString(), statusCode: attempt.status, body: '', contentType: '', truncated: false, location }
+        }
         if (hops >= limits.maxRedirects) {
           throw new LocalBrowserWebError(
             `local-browser-web: 重定向超过 ${String(limits.maxRedirects)} 跳（${request.url}）`,
@@ -189,7 +255,8 @@ export async function httpGet(request: HttpRequest): Promise<HttpResult> {
       break
     }
 
-    const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() ?? ''
+    const rawContentType = response.headers.get('content-type') ?? ''
+    const contentType = rawContentType.split(';')[0]?.trim().toLowerCase() ?? ''
     if (classifyContentType(contentType) === 'unsupported') {
       throw new LocalBrowserWebError(
         `local-browser-web: 不支持的内容类型 "${contentType}"（${response.url || request.url}）`,
@@ -208,10 +275,12 @@ export async function httpGet(request: HttpRequest): Promise<HttpResult> {
     }
 
     const { bytes, truncated: byteTruncated } = await readBounded(response, limits.maxResponseBytes)
-    const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+    const decoded = decodeBody(bytes, rawContentType)
     const overChars = decoded.length > limits.maxBodyChars
     return {
-      url: response.url === '' ? request.url : response.url,
+      // A proxied response is constructed rather than observed, so it reports no
+      // URL of its own; `target` is the last hop actually requested either way.
+      url: response.url === '' ? target.toString() : response.url,
       statusCode: response.status,
       body: overChars ? decoded.slice(0, limits.maxBodyChars) : decoded,
       contentType,

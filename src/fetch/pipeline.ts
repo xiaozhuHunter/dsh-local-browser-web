@@ -45,6 +45,37 @@ export interface FetchPipelineOutcome {
 const NEUTRAL_VERDICT: QualityVerdict = { score: 100, flags: [] }
 
 /**
+ * Character budget the *transport* gets when the extraction stage will run.
+ *
+ * Extraction scores containers over the whole document, so cutting the markup at
+ * the document cap is not a smaller version of the same result — it can delete
+ * the container that holds the article, and the scorer then falls back to a
+ * fragment (measured: a 562 KB Wikipedia page cut to 100 k yielded 1 905
+ * characters instead of 29 922). The user-facing cap is applied to the *output*
+ * further down; this one only bounds what one page may cost in memory.
+ */
+export const EXTRACT_BODY_CHARS = 2_000_000
+
+/**
+ * Convert HTML to Markdown, degrading to plain text rather than failing.
+ *
+ * The converter walks the DOM recursively, so markup that survives extraction
+ * can still exhaust the stack. Slightly worse text beats a tool call that
+ * throws — the same trade the built-in renderer makes.
+ *
+ * @param html - the cleaned HTML fragment.
+ * @param fallback - the plain text to use if conversion fails.
+ * @returns Markdown, or the fallback.
+ */
+function toMarkdownSafely(html: string, fallback: string): string {
+  try {
+    return htmlToMarkdown(html)
+  } catch {
+    return fallback
+  }
+}
+
+/**
  * Run one retrieval through all four stages.
  *
  * @param url - the URL to retrieve.
@@ -108,22 +139,40 @@ export async function runFetchPipeline(
   // ── stage 3: Markdown ───────────────────────────────────────────────────
   // Converting here means the tool layer receives finished text; keeping it off
   // hands the raw HTML over so the tool's own conversion applies instead.
-  const convert = isHtml && config.clean.markdown
-  const content = convert ? htmlToMarkdown(extracted.html.length > 0 ? extracted.html : retrieved.body) : extracted.text
-  const body: FetchPipelineOutcome['body'] = isHtml && !convert
-    ? { kind: 'html', content: extracted.html.length > 0 ? extracted.html : retrieved.body }
+  //
+  // Extraction that *declines* the markup (see `MAX_DOM_DEPTH` in ./extract.ts)
+  // answers with text and no fragment. That refusal must be honoured here too:
+  // handing the same hostile markup to the converter just moves the crash one
+  // stage later, so the degraded text is what continues down the pipeline.
+  const declined = isHtml && config.clean.extract && extracted.html.length === 0
+  const cleaned = declined ? extracted.text : extracted.html.length > 0 ? extracted.html : retrieved.body
+  const convert = isHtml && config.clean.markdown && !declined
+  const converted = convert ? toMarkdownSafely(cleaned, extracted.text) : cleaned
+  // The document cap is a context budget, so it lands on the cleaned output —
+  // not on the markup the extractor still needs whole (see EXTRACT_BODY_CHARS).
+  const overChars = converted.length > config.maxBodyChars
+  const content = overChars ? converted.slice(0, config.maxBodyChars) : converted
+  const passesHtml = isHtml && !convert && !declined
+  const body: FetchPipelineOutcome['body'] = passesHtml
+    ? { kind: 'html', content }
     : { kind: 'text', content }
 
   // ── stage 4: quality filter ─────────────────────────────────────────────
+  // Judged on plain text either way: markup attributes are not prose signals.
+  // `context: 'fetch'` selects the article floor for thin content — a snippet
+  // would be wrongly condemned by it, and an article is what this path has.
   const judged = config.clean.quality
-    ? evaluateQuality({ text: content, url: retrieved.url, title: extracted.title }, config.quality)
+    ? evaluateQuality(
+        { text: convert ? content : extracted.text, url: retrieved.url, title: extracted.title, context: 'fetch' },
+        config.quality,
+      )
     : NEUTRAL_VERDICT
 
   return {
     url: retrieved.url,
     statusCode: retrieved.statusCode,
     body,
-    truncated: retrieved.truncated,
+    truncated: retrieved.truncated || overChars,
     backend: backendId,
     chars: content.length,
     quality: judged,

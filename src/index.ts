@@ -38,8 +38,10 @@ import { EngineRegistry } from './engines/registry.ts'
 import { ParserRegistry } from './engines/parsers.ts'
 import type { RunnerContext } from './engines/runners/context.ts'
 import { FetchBackendRegistry, cdpBackend, httpBackend, playwrightBackend } from './fetch/backends.ts'
+import { EXTRACT_BODY_CHARS } from './fetch/pipeline.ts'
 import type { HttpLimits } from './http.ts'
 import { Diagnostics } from './log.ts'
+import { browserProxyOf, httpProxyOf } from './proxy.ts'
 import { LocalBrowserFetchProvider } from './providers/fetch.ts'
 import { LocalBrowserSearchProvider } from './providers/search.ts'
 import { LocalBrowserWebService } from './service.ts'
@@ -115,20 +117,24 @@ export function apply(ctx: Context, config: Config): void {
 
   const cdp = new CdpBrowser(() => {
     const current = getConfig()
+    const proxy = browserProxyOf(current.proxy)
     return {
       endpoint: current.cdpEndpoint,
       userAgent: current.userAgent,
       profileMode: current.profileMode,
       timeoutMs: current.fetchTimeoutMs,
+      ...proxy === undefined ? {} : { proxy },
     }
   })
   const playwright = new PlaywrightBrowser(() => {
     const current = getConfig()
+    const proxy = browserProxyOf(current.proxy)
     return {
       browserPath: current.browserPath,
       profileMode: current.profileMode,
       userAgent: current.userAgent,
       timeoutMs: current.fetchTimeoutMs,
+      ...proxy === undefined ? {} : { proxy },
     }
   })
 
@@ -138,12 +144,14 @@ export function apply(ctx: Context, config: Config): void {
     return {
       timeoutMs: current.fetchTimeoutMs,
       maxResponseBytes: current.maxResponseBytes,
-      maxBodyChars: current.maxBodyChars,
+      // The extractor needs the whole document; the user-facing cap is applied
+      // to the cleaned output inside the pipeline (see EXTRACT_BODY_CHARS).
+      maxBodyChars: Math.max(current.maxBodyChars, EXTRACT_BODY_CHARS),
       maxRedirects: 5,
       userAgent: current.userAgent,
     }
   }
-  backends.register('http', httpBackend(httpLimits))
+  backends.register('http', httpBackend(httpLimits, () => httpProxyOf(getConfig().proxy)))
   backends.register('cdp', cdpBackend(cdp))
   backends.register('playwright', playwrightBackend(playwright))
 

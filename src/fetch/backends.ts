@@ -19,6 +19,7 @@ import { PlaywrightBrowser } from '../browser/playwright.ts'
 import { LocalBrowserWebError } from '../errors.ts'
 import { httpGet, looksLikeChallenge } from '../http.ts'
 import type { HttpLimits } from '../http.ts'
+import type { ProxySpec } from '../proxy.ts'
 import type { BackendFetchRequest, BackendFetchResult, FetchBackend } from '../types.ts'
 
 /** Holds the backends `fetchBackend` may select, and any third-party additions. */
@@ -71,7 +72,10 @@ export class FetchBackendRegistry {
 }
 
 /** The plain-transport backend. Never runs JavaScript, so `render` is ignored. */
-export function httpBackend(limits: () => HttpLimits): FetchBackend {
+export function httpBackend(
+  limits: () => HttpLimits,
+  proxy: () => ProxySpec | undefined = () => undefined,
+): FetchBackend {
   return {
     id: 'http',
     available: () => true,
@@ -79,6 +83,7 @@ export function httpBackend(limits: () => HttpLimits): FetchBackend {
       const result = await httpGet({
         url: request.url,
         limits: { ...limits(), timeoutMs: request.timeoutMs },
+        proxy: proxy(),
         ...request.signal === undefined ? {} : { signal: request.signal },
       })
       return {
@@ -100,7 +105,7 @@ export function cdpBackend(browser: CdpBrowser): FetchBackend {
     // unreachable endpoint surfaces per call as BROWSER_UNAVAILABLE.
     available: () => browser.cachedReachable() ?? true,
     async fetch(request: BackendFetchRequest): Promise<BackendFetchResult> {
-      const page = await browser.render(request.url, request.signal)
+      const page = await browser.render(request.url, request.signal, request.waitFor)
       if (looksLikeChallenge(page.statusCode, page.html)) {
         throw new LocalBrowserWebError(
           `local-browser-web: 页面返回人机验证/拦截页（HTTP ${String(page.statusCode)}，${request.url}）`,
@@ -125,7 +130,7 @@ export function playwrightBackend(browser: PlaywrightBrowser): FetchBackend {
     id: 'playwright',
     available: () => true,
     async fetch(request: BackendFetchRequest): Promise<BackendFetchResult> {
-      const page = await browser.render(request.url, request.signal)
+      const page = await browser.render(request.url, request.signal, request.waitFor)
       if (looksLikeChallenge(page.statusCode, page.html)) {
         throw new LocalBrowserWebError(
           `local-browser-web: 页面返回人机验证/拦截页（HTTP ${String(page.statusCode)}，${request.url}）`,

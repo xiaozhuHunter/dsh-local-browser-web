@@ -24,7 +24,10 @@ export function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedCon
     maxConcurrency: 2,
     maxResponseBytes: 5_000_000,
     maxBodyChars: 100_000,
-    userAgent: 'deepseek-harness-local-browser/0.1.0',
+    // Empty is the shipped default: HTTP falls back to the built-in browser UA and
+    // the browser transports keep the UA of the Chrome they drive.
+    userAgent: '',
+    proxy: { enabled: false, url: '', bypass: 'localhost,127.0.0.1,::1', http: true, browser: true },
     clean: {
       transport: true,
       render: true,
@@ -36,10 +39,14 @@ export function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedCon
     quality: {
       enabled: true,
       thinContent: { enabled: true, minChars: 200 },
+      snippetMinChars: 40,
       seoSpam: { enabled: true, maxKeywordDensity: 0.12, maxDuplicateRatio: 0.5 },
       lowQualityAigc: { enabled: true, maxAigcMarkerRatio: 0.05 },
       domainReputation: { enabled: true, blocklist: [], allowlist: [] },
       authority: { enabled: true, minScore: 30 },
+      freshness: { enabled: true, staleDays: 365 },
+      conflict: { enabled: true },
+      annotate: { enabled: true },
     },
     logLevel: 'silent',
     structuredLog: false,

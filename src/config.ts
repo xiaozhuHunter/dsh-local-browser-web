@@ -13,6 +13,7 @@
 import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { LocalBrowserWebError } from './errors.ts'
+import { parseProxyUrl, type ProxyConfig } from './proxy.ts'
 import type {
   DispatchMode,
   EngineExtraParams,
@@ -40,7 +41,16 @@ export const DEFAULT_CDP_ENDPOINT = 'http://127.0.0.1:9222'
  * browser-like UA override this per engine through `extraParams`, but the plugin
  * never pretends to be Chrome by default.
  */
-export const DEFAULT_USER_AGENT = 'deepseek-harness-local-browser/0.1.0'
+/**
+ * User-Agent the HTTP backend falls back to when the setting is empty.
+ *
+ * It must look like a real browser: engines answer a self-identifying crawler UA
+ * with a degraded, script-less page (Google's "enable JavaScript" shell among
+ * them), which then parses to zero results. The browser transports do not use this
+ * constant at all — they keep the UA of the Chrome they drive, which is always the
+ * right version.
+ */
+export const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36'
 
 /** Built-in search engines. Bing is the light HTTP path; DuckDuckGo needs a real render. */
 export const DEFAULT_ENGINES: EngineSpec[] = [
@@ -58,18 +68,81 @@ export const DEFAULT_ENGINES: EngineSpec[] = [
   {
     id: 'duckduckgo',
     label: 'DuckDuckGo',
-    kind: 'browser',
-    endpoint: 'https://duckduckgo.com/?q={query}',
+    // The main surface is a React app that stays blank when its script bundle
+    // cannot finish loading over a proxy; the `html/` endpoint answers with the
+    // same ten results already server-rendered, so it needs no browser at all.
+    kind: 'http-html',
+    endpoint: 'https://html.duckduckgo.com/html/?q={query}',
     requiresKey: false,
     resultParser: 'html-ddg',
     priority: 20,
     enabledByDefault: true,
     enabled: true,
   },
+  {
+    // Baidu answers a plain HTTP GET with its 安全验证 interstitial, so this engine
+    // is a `browser` kind: the render carries the cookies and TLS fingerprint a
+    // real browser has, which is what the interstitial checks. The mobile surface
+    // (`m.baidu.com`) is the one that reliably serves server-rendered results —
+    // the desktop `/s` endpoint still gates unfamiliar networks, so it ships as the
+    // separate, opt-in `baidu-pc` entry below.
+    id: 'baidu',
+    label: '百度搜索',
+    kind: 'browser',
+    endpoint: 'https://m.baidu.com/s?word={query}',
+    requiresKey: false,
+    resultParser: 'html-baidu',
+    priority: 30,
+    enabledByDefault: true,
+    enabled: true,
+  },
+  {
+    // The canonical desktop SERP. Enabled for networks and browser profiles Baidu
+    // already trusts; otherwise it fails as a challenge and dispatch moves on.
+    id: 'baidu-pc',
+    label: '百度搜索（桌面端）',
+    kind: 'browser',
+    endpoint: 'https://www.baidu.com/s?wd={query}&ie=utf-8',
+    requiresKey: false,
+    resultParser: 'html-baidu',
+    priority: 35,
+    enabledByDefault: false,
+    enabled: false,
+  },
+  {
+    // Google renders its SERP client-side and gates plain fetches, so it renders
+    // too — and, like any browser-kind engine, needs a reachable CDP endpoint.
+    id: 'google',
+    label: 'Google 搜索',
+    kind: 'browser',
+    endpoint: 'https://www.google.com/search?q={query}&num=10',
+    requiresKey: false,
+    resultParser: 'html-google',
+    priority: 40,
+    enabledByDefault: true,
+    enabled: true,
+    // Google publishes `/goto?url=<encrypted token>` instead of the destination,
+    // so each result needs one hop resolved before it is a usable URL.
+    unwrapRedirect: '^https?://[^/]*\\.google\\.[a-z.]+/(?:goto|url)\\?',
+    extraParams: { language: 'zh-CN' },
+  },
+  {
+    // 360 Search (so.com) serves a complete server-rendered SERP, so it stays on
+    // the cheap HTTP path: no browser, no JavaScript, and no CDP dependency.
+    id: 'so360',
+    label: '360 搜索',
+    kind: 'http-html',
+    endpoint: 'https://www.so.com/s?q={query}&ie=utf-8',
+    requiresKey: false,
+    resultParser: 'html-so360',
+    priority: 50,
+    enabledByDefault: true,
+    enabled: true,
+  },
 ]
 
 /** Result-parser ids that ship with the plugin. */
-export const BUILT_IN_PARSERS = ['html-bing', 'html-ddg', 'json-generic'] as const
+export const BUILT_IN_PARSERS = ['html-bing', 'html-ddg', 'html-baidu', 'html-google', 'html-so360', 'json-generic'] as const
 
 /** Engine execution routes the schema accepts. */
 const ENGINE_KINDS: readonly EngineKind[] = ['http-html', 'browser', 'api']
@@ -101,6 +174,7 @@ const engineSchema = z.object({
   priority: z.number().step(1).default(100).comment('回退顺序，越小越先'),
   enabledByDefault: z.boolean().default(false).comment('新装默认是否启用'),
   enabled: z.boolean().default(true).comment('当前是否参与调度'),
+  unwrapRedirect: z.string().comment('跳转链正则：命中的结果 URL 会跟随一跳解析真实地址（如 Google 的 /goto?url=）；留空表示解析结果已是目标地址'),
   extraParams: engineExtraParamsSchema.comment('引擎专属参数'),
 })
 
@@ -111,6 +185,8 @@ const qualitySchema = z.object({
     enabled: z.boolean().default(true).volatile().comment('薄内容检测'),
     minChars: z.number().step(1).min(0).default(200).volatile().comment('正文字符数下限，低于即判薄内容'),
   }),
+  snippetMinChars: z.number().step(1).min(0).default(40).volatile()
+    .comment('搜索摘要的字符数下限（摘要天然比正文短，不能套用正文字数）'),
   seoSpam: z.object({
     enabled: z.boolean().default(true).volatile().comment('SEO 垃圾特征检测'),
     maxKeywordDensity: z.number().min(0).max(1).default(0.12).volatile().comment('关键词密度上限（0-1）'),
@@ -126,13 +202,41 @@ const qualitySchema = z.object({
     allowlist: z.array(z.string()).default([]).volatile().comment('域名白名单（命中即豁免黑名单与部分规则）'),
   }),
   authority: z.object({
-    enabled: z.boolean().default(true).volatile().comment('权威度信号检测'),
+    enabled: z.boolean().default(true).volatile().comment('权威度评估（来源分层 + 一手性 + 时效）'),
     minScore: z.number().min(0).max(100).default(30).volatile().comment('权威度得分下限，低于即在结果中降权'),
+  }),
+  freshness: z.object({
+    enabled: z.boolean().default(true).volatile().comment('时效性评估（旧闻降权、缺日期扣分）'),
+    staleDays: z.number().step(1).min(0).default(365).volatile().comment('超过该天数的内容判为陈旧'),
+  }),
+  conflict: z.object({
+    enabled: z.boolean().default(true).volatile().comment('跨源冲突检测（同题不同源数值分歧并排标注）'),
+  }),
+  annotate: z.object({
+    enabled: z.boolean().default(true).volatile().comment('把来源性质写进摘要，供模型直接看到'),
   }),
 })
 
-/** The four-stage cleaning pipeline's per-stage switches. */
-const cleanSchema = z.object({
+/**
+ * The outbound-proxy group.
+ *
+ * Two egress switches rather than one, because the two transports fail
+ * differently: an HTTP proxy is enough for `http-html` engines, while a search
+ * engine that must be rendered needs the browser to send its traffic through the
+ * proxy too. Keeping them separate lets a local proxy that only relays TLS
+ * (e.g. a CONNECT-only relay) serve the browser while HTTP engines stay direct.
+ */
+const proxySchema = z.object({
+  enabled: z.boolean().default(false).volatile().comment('代理总开关（关闭时所有通道直连）'),
+  url: z.string().default('').volatile()
+    .comment('代理地址：http://127.0.0.1:7890、socks5://127.0.0.1:7891，或省略协议的 127.0.0.1:7890'),
+  bypass: z.string().default('localhost,127.0.0.1,::1').volatile()
+    .comment('直连名单（逗号分隔，支持 example.com 后缀匹配与 *）'),
+  http: z.boolean().default(true).volatile().comment('HTTP 通道走代理：http-html / api 引擎与 http 抓取后端'),
+  browser: z.boolean().default(true).volatile().comment('浏览器渲染走代理：CDP / Playwright 抓取与 browser 类引擎'),
+})
+
+/** The four-stage cleaning pipeline's per-stage switches. */const cleanSchema = z.object({
   transport: z.object({
     enabled: z.boolean().default(true).volatile().comment('阶段一：传输层安全（SSRF 守卫/重定向/超时/体积/类型）'),
   }),
@@ -185,6 +289,14 @@ export interface Config {
   maxBodyChars: Volatile<number>
   /** `User-Agent` sent by the HTTP backend and by HTTP-kind engines. */
   userAgent: Volatile<string>
+  /** Outbound proxy for the HTTP and browser transports. */
+  proxy: {
+    enabled: Volatile<boolean>
+    url: Volatile<string>
+    bypass: Volatile<string>
+    http: Volatile<boolean>
+    browser: Volatile<boolean>
+  }
   /** Four-stage cleaning pipeline switches. */
   clean: {
     transport: { enabled: Volatile<boolean> }
@@ -197,6 +309,7 @@ export interface Config {
   quality: {
     enabled: Volatile<boolean>
     thinContent: { enabled: Volatile<boolean>, minChars: Volatile<number> }
+    snippetMinChars: Volatile<number>
     seoSpam: {
       enabled: Volatile<boolean>
       maxKeywordDensity: Volatile<number>
@@ -209,6 +322,9 @@ export interface Config {
       allowlist: Volatile<string[]>
     }
     authority: { enabled: Volatile<boolean>, minScore: Volatile<number> }
+    freshness: { enabled: Volatile<boolean>, staleDays: Volatile<number> }
+    conflict: { enabled: Volatile<boolean> }
+    annotate: { enabled: Volatile<boolean> }
   }
   /** Structured-log verbosity. */
   logLevel: Volatile<LogLevel>
@@ -247,7 +363,10 @@ export const Config = z.object({
     .comment('响应体字节上限'),
   maxBodyChars: z.number().step(1).min(256).default(100_000).volatile()
     .comment('正文解码后字符上限'),
-  userAgent: z.string().default(DEFAULT_USER_AGENT).volatile().comment('HTTP 请求使用的 User-Agent'),
+  userAgent: z.string().default('').volatile()
+    .comment('HTTP 请求的 User-Agent；留空则使用内置的桌面 Chrome UA，浏览器渲染始终使用本机 Chrome 自身 UA'),
+
+  proxy: proxySchema,
 
   clean: cleanSchema,
   quality: qualitySchema,
@@ -275,6 +394,7 @@ export interface ResolvedConfig {
   maxResponseBytes: number
   maxBodyChars: number
   userAgent: string
+  proxy: ProxyConfig
   clean: {
     transport: boolean
     render: boolean
@@ -286,10 +406,14 @@ export interface ResolvedConfig {
   quality: {
     enabled: boolean
     thinContent: { enabled: boolean, minChars: number }
+    snippetMinChars: number
     seoSpam: { enabled: boolean, maxKeywordDensity: number, maxDuplicateRatio: number }
     lowQualityAigc: { enabled: boolean, maxAigcMarkerRatio: number }
     domainReputation: { enabled: boolean, blocklist: string[], allowlist: string[] }
     authority: { enabled: boolean, minScore: number }
+    freshness: { enabled: boolean, staleDays: number }
+    conflict: { enabled: boolean }
+    annotate: { enabled: boolean }
   }
   logLevel: LogLevel
   structuredLog: boolean
@@ -325,6 +449,13 @@ export function readConfig(config: Config): ResolvedConfig {
     maxResponseBytes: config.maxResponseBytes.get(),
     maxBodyChars: config.maxBodyChars.get(),
     userAgent: config.userAgent.get(),
+    proxy: {
+      enabled: config.proxy.enabled.get(),
+      url: config.proxy.url.get(),
+      bypass: config.proxy.bypass.get(),
+      http: config.proxy.http.get(),
+      browser: config.proxy.browser.get(),
+    },
     clean: {
       transport: config.clean.transport.enabled.get(),
       render: config.clean.render.enabled.get(),
@@ -339,6 +470,7 @@ export function readConfig(config: Config): ResolvedConfig {
         enabled: config.quality.thinContent.enabled.get(),
         minChars: config.quality.thinContent.minChars.get(),
       },
+      snippetMinChars: config.quality.snippetMinChars.get(),
       seoSpam: {
         enabled: config.quality.seoSpam.enabled.get(),
         maxKeywordDensity: config.quality.seoSpam.maxKeywordDensity.get(),
@@ -356,6 +488,16 @@ export function readConfig(config: Config): ResolvedConfig {
       authority: {
         enabled: config.quality.authority.enabled.get(),
         minScore: config.quality.authority.minScore.get(),
+      },
+      freshness: {
+        enabled: config.quality.freshness.enabled.get(),
+        staleDays: config.quality.freshness.staleDays.get(),
+      },
+      conflict: {
+        enabled: config.quality.conflict.enabled.get(),
+      },
+      annotate: {
+        enabled: config.quality.annotate.enabled.get(),
       },
     },
     logLevel: config.logLevel.get(),
@@ -407,6 +549,19 @@ export function validateConfig(resolved: ResolvedConfig, parsedIds: readonly str
   if (!Number.isFinite(resolved.fetchTimeoutMs) || resolved.fetchTimeoutMs <= 0) fail('fetchTimeoutMs 必须为正数')
   if (!Number.isFinite(resolved.searchTimeoutMs) || resolved.searchTimeoutMs <= 0) fail('searchTimeoutMs 必须为正数')
   if (!Number.isInteger(resolved.maxConcurrency) || resolved.maxConcurrency < 1) fail('maxConcurrency 必须为正整数')
+
+  if (resolved.proxy.enabled) {
+    try {
+      parseProxyUrl(resolved.proxy.url, resolved.proxy.bypass)
+    } catch (error) {
+      // `parseProxyUrl` already names the offending part; only the wrapper is
+      // rewritten so the message is not prefixed twice.
+      const detail = error instanceof Error
+        ? error.message.replace(/^local-browser-web:\s*/u, '')
+        : String(error)
+      fail(`代理配置无效：${detail}`)
+    }
+  }
 
   const seen = new Set<string>()
   for (const engine of resolved.engines) {

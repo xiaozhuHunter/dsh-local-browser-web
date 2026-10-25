@@ -113,9 +113,16 @@ describe('json-generic parser', () => {
 })
 
 describe('ParserRegistry', () => {
-  it('ships the three built-in strategies and reports unknown ids', () => {
+  it('ships the six built-in strategies and reports unknown ids', () => {
     const registry = new ParserRegistry()
-    assert.deepEqual(registry.ids(), ['html-bing', 'html-ddg', 'json-generic'])
+    assert.deepEqual(registry.ids(), [
+      'html-baidu',
+      'html-bing',
+      'html-ddg',
+      'html-google',
+      'html-so360',
+      'json-generic',
+    ])
     const error = thrown(() => registry.parse('missing', {
       engine: makeEngine(),
       query: 'q',

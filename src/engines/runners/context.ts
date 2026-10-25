@@ -10,6 +10,7 @@
 import type { CdpBrowser } from '../../browser/cdp.ts'
 import type { PlaywrightBrowser } from '../../browser/playwright.ts'
 import type { ResolvedConfig } from '../../config.ts'
+import { DEFAULT_USER_AGENT } from '../../config.ts'
 import type { ParserRegistry } from '../parsers.ts'
 import type { EngineKind, EngineSpec, RawSearchSource } from '../../types.ts'
 
@@ -67,6 +68,12 @@ const PARAM_NAMES: Record<string, ParamNames> = {
     safeSearch: 'kp',
     safeSearchValues: { off: '-2', moderate: '-1', strict: '1' },
   },
+  google: {
+    region: 'gl',
+    language: 'hl',
+    safeSearch: 'safe',
+    safeSearchValues: { off: 'off', moderate: 'active', strict: 'active' },
+  },
 }
 
 /** The generic fallback parameter names. */
@@ -111,6 +118,17 @@ export function buildSearchUrl(engine: EngineSpec, query: string): URL {
   return url
 }
 
+/**
+ * Ceiling for a SERP body, independent of the document cap.
+ *
+ * A SERP is not a document: engines ship hundreds of kilobytes of inlined CSS and
+ * bootstrap JSON *before* the result list — 360 Search places its first result
+ * around 330 KB, and beyond that on other surfaces. Applying the 100 k document cap
+ * here silently yields "0 results" for a page that has plenty. The parsed sources
+ * are all that leave the runner, so this bound costs memory, not model context.
+ */
+const SEARCH_BODY_CHARS = 2_000_000
+
 /** The HTTP limits one search uses, derived from the live config. */
 export function searchLimits(config: ResolvedConfig): {
   timeoutMs: number
@@ -123,8 +141,9 @@ export function searchLimits(config: ResolvedConfig): {
     timeoutMs: config.searchTimeoutMs,
     // Search responses are small; the fetch caps are a safe, generous bound.
     maxResponseBytes: config.maxResponseBytes,
-    maxBodyChars: config.maxBodyChars,
+    maxBodyChars: Math.max(config.maxBodyChars, SEARCH_BODY_CHARS),
     maxRedirects: 5,
-    userAgent: config.userAgent,
+    // An empty setting means "present as a normal browser", not "send no UA".
+    userAgent: config.userAgent.length > 0 ? config.userAgent : DEFAULT_USER_AGENT,
   }
 }

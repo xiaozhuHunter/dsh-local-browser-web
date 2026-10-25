@@ -8,11 +8,14 @@
  * Built-ins:
  * - `html-bing`   — Bing's HTML SERP (`li.b_algo`).
  * - `html-ddg`    — DuckDuckGo, both its HTML endpoint and its rendered page.
+ * - `html-baidu`  — Baidu's rendered SERP (`#content_left` blocks, `mu` target).
+ * - `html-google` — Google's rendered SERP (`#rso` blocks, `h3` title anchors).
+ * - `html-so360`  — 360 Search's SERP (`li.res-list`, `data-mdurl` target).
  * - `json-generic`— a JSON API, with field paths taken from the engine's `extraParams`.
  *
  * @module dsh-local-browser-web/engines/parsers
  */
-import { JSDOM } from 'jsdom'
+import { JSDOM, VirtualConsole } from 'jsdom'
 import { LocalBrowserWebError } from '../errors.ts'
 import type { EngineSpec, ParserInput, RawSearchSource, ResultParser } from '../types.ts'
 
@@ -22,9 +25,15 @@ interface Dom {
   close: () => void
 }
 
-/** Parse one HTML payload into a detached document. */
+/**
+ * Parse one HTML payload into a detached document.
+ *
+ * A SERP carries megabytes of inlined CSS that jsdom cannot fully parse; those
+ * reports are dropped rather than printed, because the plugin's own diagnostics
+ * are the channel an operator reads.
+ */
 function domOf(html: string): Dom {
-  const dom = new JSDOM(html, { pretendToBeVisual: false })
+  const dom = new JSDOM(html, { pretendToBeVisual: false, virtualConsole: new VirtualConsole() })
   return { document: dom.window.document, close: () => { dom.window.close() } }
 }
 
@@ -76,6 +85,65 @@ function firstText(root: Element, selectors: readonly string[]): string | undefi
     if (text !== undefined) return text
   }
   return undefined
+}
+
+/**
+ * Resolve the destination of a SERP link, preferring an explicit "real URL"
+ * attribute over the click-tracking wrapper.
+ *
+ * Baidu keeps the true target in `mu` on the result block, 360 in `data-mdurl` on
+ * the anchor, and Google in `/url?q=`. Reading them is what stops a source's URL
+ * from being the engine's own tracking redirect.
+ *
+ * @param owner - the result block (attributes are also looked up here).
+ * @param anchor - the title anchor.
+ * @param attributes - attributes that may already hold the target, in order.
+ * @param base - the engine endpoint, used to resolve relatives.
+ * @returns the absolute target, or undefined.
+ */
+function serpUrl(
+  owner: Element | null | undefined,
+  anchor: Element | null | undefined,
+  attributes: readonly string[],
+  base: string,
+): string | undefined {
+  for (const attribute of attributes) {
+    const raw = owner?.getAttribute(attribute) ?? anchor?.getAttribute(attribute)
+    const url = absoluteUrl(raw, base)
+    if (url !== undefined) return unwrapQueryRedirect(url, base)
+  }
+  const href = absoluteUrl(anchor?.getAttribute('href'), base)
+  return href === undefined ? undefined : unwrapQueryRedirect(href, base)
+}
+
+/**
+ * Unwrap the `/url?q=`-style redirect wrappers the SERPs use for outbound links.
+ *
+ * @param url - an already-absolute URL.
+ * @param base - the engine endpoint, used to resolve the unwrapped target.
+ * @returns the target when the wrapper carries one, else the input.
+ */
+function unwrapQueryRedirect(url: string, base: string): string {
+  const parsed = new URL(url)
+  const wrapped = parsed.searchParams.get('q')
+    ?? parsed.searchParams.get('url')
+    ?? parsed.searchParams.get('uddg')
+    ?? parsed.searchParams.get('u')
+  if (wrapped === null || !wrapped.startsWith('http')) return url
+  // Only unwrap when the wrapper is the engine's own redirect path, not a real
+  // query string that merely happens to contain a URL.
+  if (!/^\/(url|link|search\/url)$|^\/l\/$/u.test(parsed.pathname)) return url
+  const target = absoluteUrl(wrapped, base)
+  return target ?? url
+}
+
+/** Whether a SERP block is a paid placement rather than an organic result. */
+function isAd(block: Element): boolean {
+  if (block.hasAttribute('data-text-ad') || block.hasAttribute('data-tuiguang')) return true
+  const marker = block.getAttribute('class') ?? ''
+  if (/ec_ad|ec-tuiguang|ec_tuiguang/u.test(marker)) return true
+  if (block.closest('#tads, #bottomads, #tadsb') !== null) return true
+  return block.querySelector('[class*="tuiguang"], [data-tuiguang], [data-text-ad], .ad-icon, [aria-label="Ads"]') !== null
 }
 
 /** Parse Bing's HTML SERP. */
@@ -133,6 +201,214 @@ export const htmlDdgParser: ResultParser = (input) => {
         if (title === undefined || title.length < 4) continue
         sources.push({ url, title })
       }
+    }
+    return sources
+  } finally {
+    close()
+  }
+}
+
+/**
+ * DuckDuckGo's main surface is a React app: the document arrives as a shell and
+ * the result list is injected, so the parser waits for the list wrapper.
+ */
+htmlDdgParser.waitFor = ['article[data-testid="result"]', 'ol.react-results--main', 'div.result']
+
+/**
+ * Refuse a SERP that is actually a bot interstitial.
+ *
+ * Baidu answers a plain or unfamiliar request with a `wappass` captcha page whose
+ * HTTP status is still 200, so "0 results" would be a misleading verdict: the
+ * engine was never asked. Naming the challenge lets the dispatcher fall through to
+ * the next engine, and lets `local_search_test` report the real failure stage.
+ *
+ * @param input - the payload being parsed.
+ * @throws {LocalBrowserWebError} `WEB_FETCH_CHALLENGE` when the page is a gate.
+ */
+function assertNotSerpChallenge(input: ParserInput): void {
+  const head = input.body.slice(0, 6_000)
+  if (head.includes('百度安全验证') || head.includes('wappass.baidu.com/static/captcha')) {
+    throw new LocalBrowserWebError(
+      `local-browser-web: 引擎 "${input.engine.id}" 返回百度人机验证页（需要在浏览器中通过验证，或改用移动端 / 更换网络）`,
+      'WEB_FETCH_CHALLENGE',
+    )
+  }
+}
+
+/**
+ * Read the real destination out of Baidu's mobile card payload.
+ *
+ * The mobile SERP keeps it in the `data-log` JSON (`mu`, or
+ * `logCommonInfo.exposureInfo.url`) while `href` points at Baidu's own redirect,
+ * so the attribute is the only faithful source of a URL.
+ *
+ * @param block - one mobile result card.
+ * @param base - the engine endpoint, used to resolve relatives.
+ * @returns the absolute target, or undefined.
+ */
+function dataLogUrl(block: Element, base: string): string | undefined {
+  const raw = block.getAttribute('data-log')
+  if (raw === null) return undefined
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    const at = (path: readonly string[]): unknown => {
+      let cursor: unknown = parsed
+      for (const key of path) {
+        if (cursor === null || typeof cursor !== 'object') return undefined
+        cursor = Reflect.get(cursor, key)
+      }
+      return cursor
+    }
+    const candidate = at(['mu']) ?? at(['logCommonInfo', 'exposureInfo', 'url'])
+    return typeof candidate === 'string' ? absoluteUrl(candidate, base) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Baidu's own placement hosts: recommendation slots and the "no url" interstitial. */
+const BAIDU_PLACEMENT = /(^|\.)(?:recommend_list|ubs)\.baidu\.com$/iu
+
+/** Parse Baidu's SERP — the desktop `#content_left` blocks and the mobile `c-result` cards. */
+export const htmlBaiduParser: ResultParser = (input) => {
+  assertNotSerpChallenge(input)
+  const { document, close } = domOf(input.body)
+  try {
+    const sources: RawSearchSource[] = []
+    const seen = new Set<string>()
+    const push = (source: RawSearchSource | undefined): void => {
+      if (source === undefined || seen.has(source.url)) return
+      // Baidu mixes placement slots in with the results; those hosts answer with
+      // redirects to its own products and carry no title, so they are not sources.
+      if (BAIDU_PLACEMENT.test(new URL(source.url).hostname)) return
+      seen.add(source.url)
+      sources.push(source)
+    }
+    // Desktop: the real target is in `mu` on the result block.
+    for (const block of document.querySelectorAll('#content_left > div.result, #content_left > div.result-op, div.result.c-container, div.c-container[mu]')) {
+      if (isAd(block)) continue
+      const anchor = block.querySelector('h3 a[href], h3 a, a[href]')
+      const url = serpUrl(block, anchor, ['mu', 'data-landurl'], input.engine.endpoint)
+      if (url === undefined) continue
+      push({
+        url,
+        ...withField('title', squash(anchor?.textContent)),
+        ...withField('snippet', firstText(block, [
+          '.c-abstract',
+          '[class*="content-right"]',
+          '[class*="c-line-clamp"]',
+          '.c-span-last',
+          '[class*="summary"]',
+        ])),
+        ...withField('publishedAt', firstText(block, [
+          '[class*="c-color-gray2"]',
+          'span.c-color-gray',
+          '[class*="c-showurl"] span',
+        ])),
+      })
+    }
+    // Mobile (m.baidu.com): SSR cards, real target inside `data-log`.
+    for (const block of document.querySelectorAll('div.c-result')) {
+      if (isAd(block)) continue
+      const anchor = block.querySelector('h3 a[href], h3.cosc-title, h3, a[href]')
+      const url = dataLogUrl(block, input.engine.endpoint)
+        ?? serpUrl(block, anchor, ['mu', 'rl-link-href', 'data-landurl'], input.engine.endpoint)
+      if (url === undefined) continue
+      push({
+        url,
+        ...withField('title', firstText(block, ['h3.cosc-title', '[data-module="title"] h3', 'h3'])),
+        ...withField('snippet', firstText(block, [
+          '[data-module="summary"]',
+          '.cosc-summary',
+          '.c-abstract',
+          '.cos-line-clamp-2',
+          '[class*="summary"]',
+        ])),
+      })
+    }
+    return sources
+  } finally {
+    close()
+  }
+}
+
+/** Google's click trackers: the destination lives inside the token, not the href. */
+const GOOGLE_TRACKER = /^https?:\/\/[^/]*google\.[a-z.]+\/(?:goto|url)\?/iu
+
+/** Parse a rendered Google SERP (`#rso` blocks, `h3` inside the title anchor). */
+export const htmlGoogleParser: ResultParser = (input) => {
+  const { document, close } = domOf(input.body)
+  try {
+    // Google nests `div.g` inside `div.MjjYud`; pick ONE granularity so a result is
+    // not read twice, and fall back to the older single-wrapper markup.
+    const wrappers = [...document.querySelectorAll('#rso div.MjjYud')]
+    const blocks = wrappers.length > 0 ? wrappers : [...document.querySelectorAll('div.g, div.tF2Cxc')]
+    const sources: RawSearchSource[] = []
+    const seen = new Set<string>()
+    for (const block of blocks) {
+      if (isAd(block)) continue
+      const heading = block.querySelector('h3')
+      const anchor = heading?.closest('a') ?? block.querySelector('a[href] h3')?.closest('a') ?? block.querySelector('a[href]')
+      const url = serpUrl(block, anchor, [], input.engine.endpoint)
+      if (url === undefined || seen.has(url)) continue
+      // Google's own surfaces (cache, policy pages, "more results") are not sources.
+      // Its click trackers are the exception: `/goto?url=` and `/url?` do carry the
+      // destination, which the engine's `unwrapRedirect` resolves into a real URL.
+      if (!GOOGLE_TRACKER.test(url) && /(^|\.)google\.[a-z.]+$/u.test(new URL(url).hostname)) continue
+      seen.add(url)
+      sources.push({
+        url,
+        ...withField('title', squash(heading?.textContent) ?? squash(anchor?.textContent)),
+        ...withField('snippet', firstText(block, [
+          '.VwiC3b',
+          'div.IsZvec',
+          'span.aCOpRe',
+          '.aCOpRe',
+          '[data-sncf]',
+        ])),
+        ...withField('publishedAt', firstText(block, ['span.MUxGbd span', '.LEwnzc span', 'span.r0bn4c'])),
+      })
+    }
+    return sources
+  } finally {
+    close()
+  }
+}
+
+/**
+ * Google answers a plain fetch with an "enable JavaScript" shell and only builds
+ * `#rso` client-side, so the rendered DOM is empty until that node exists.
+ */
+htmlGoogleParser.waitFor = ['#rso']
+
+/** Parse 360 Search's SERP (`ul.result > li.res-list`, real URL in `data-mdurl`). */
+export const htmlSo360Parser: ResultParser = (input) => {
+  const { document, close } = domOf(input.body)
+  try {
+    const blocks = [...document.querySelectorAll('ul.result > li.res-list, li.res-list')]
+    const sources: RawSearchSource[] = []
+    const engineHost = new URL(input.engine.endpoint).hostname.toLowerCase()
+    for (const block of blocks) {
+      if (isAd(block)) continue
+      const anchor = block.querySelector('h3.res-title a[href], h3 a[href], a[href]')
+      const url = serpUrl(block, anchor, ['data-mdurl'], input.engine.endpoint)
+      if (url === undefined) continue
+      // "大家都在搜" blocks link back to another 360 SERP; that is a suggestion
+      // surface, not a source.
+      const resolved = new URL(url)
+      if (resolved.hostname.toLowerCase() === engineHost && /^\/s\/?$/u.test(resolved.pathname)) continue
+      sources.push({
+        url,
+        ...withField('title', squash(anchor?.textContent)),
+        ...withField('snippet', firstText(block, [
+          '.res-list-summary',
+          '[data-result-summary]',
+          'p.res-desc',
+          '.res-desc',
+          '.res-comm-con p',
+        ])),
+        ...withField('publishedAt', firstText(block, ['span.gray', '.res-date', '[class*="date"]'])),
+      })
     }
     return sources
   } finally {
@@ -229,6 +505,9 @@ export class ParserRegistry {
   constructor() {
     this.parsers.set('html-bing', htmlBingParser)
     this.parsers.set('html-ddg', htmlDdgParser)
+    this.parsers.set('html-baidu', htmlBaiduParser)
+    this.parsers.set('html-google', htmlGoogleParser)
+    this.parsers.set('html-so360', htmlSo360Parser)
     this.parsers.set('json-generic', jsonGenericParser)
   }
 
@@ -252,6 +531,18 @@ export class ParserRegistry {
   /** Whether a strategy id is registered. */
   has(id: string): boolean {
     return this.parsers.has(id)
+  }
+
+  /**
+   * Selectors a strategy needs before its document is worth reading.
+   *
+   * Runners relay this to the rendering backend; an unknown id yields `[]` so a
+   * later `parse` call is what reports the missing strategy.
+   * @param id - the strategy id.
+   * @returns the declared selectors, empty when there are none.
+   */
+  waiters(id: string): readonly string[] {
+    return this.parsers.get(id)?.waitFor ?? []
   }
 
   /** Every registered strategy id, sorted for stable diagnostics. */

@@ -13,11 +13,13 @@
  * @module dsh-local-browser-web/engines/dispatch
  */
 import { LocalBrowserWebError } from '../errors.ts'
+import { httpProxyOf } from '../proxy.ts'
 import type { DispatchMode, EngineSpec, EngineKind, RawSearchSource } from '../types.ts'
 import { apiRunner } from './runners/api.ts'
 import { browserRunner } from './runners/browser.ts'
 import { httpHtmlRunner } from './runners/http-html.ts'
-import type { EngineRunner, RunnerContext } from './runners/context.ts'
+import { searchLimits, type EngineRunner, type RunnerContext } from './runners/context.ts'
+import { unwrapRedirects } from './unwrap.ts'
 
 /** One engine's failure, kept for diagnostics. */
 export interface EngineFailure {
@@ -61,7 +63,18 @@ async function runEngine(
 ): Promise<{ sources: RawSearchSource[] } | { failure: EngineFailure }> {
   try {
     const sources = await runnerFor(engine.kind, ctx)(engine, query, ctx, signal)
-    return { sources }
+    // A tracker URL is not a destination: engines that say so get one redirect hop
+    // resolved here, before ranking and dedupe ever see the URL.
+    if (engine.unwrapRedirect === undefined) return { sources }
+    const config = ctx.config()
+    const proxy = httpProxyOf(config.proxy)
+    const unwrapped = await unwrapRedirects(sources, {
+      pattern: engine.unwrapRedirect,
+      limits: searchLimits(config),
+      ...proxy === undefined ? {} : { proxy },
+      ...signal === undefined ? {} : { signal },
+    })
+    return { sources: unwrapped }
   } catch (error) {
     const code = error instanceof LocalBrowserWebError ? error.code : 'ENGINE_TEST_FAILED'
     return {

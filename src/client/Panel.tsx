@@ -3,8 +3,8 @@
  *
  * Mounted at the `settings.section` slot so it gets its own entry in the DSH
  * Settings navigation (rather than living as a tab under the Plugins section).
- * Inside, five tabs keep the ~40 editable fields legible: search (with the engine
- * registry editor), fetch, cleaning, quality, and general.
+ * Inside, six tabs keep the ~45 editable fields legible: search (with the engine
+ * registry editor), fetch, proxy, cleaning, quality, and general.
  *
  * Every control stages a draft; the form's save is the single write.
  *
@@ -31,10 +31,10 @@ export type PanelProps =
   & InjectFace<PanelFace>
 
 /** The panel's tabs. */
-type TabValue = 'search' | 'fetch' | 'clean' | 'quality' | 'general'
+type TabValue = 'search' | 'fetch' | 'proxy' | 'clean' | 'quality' | 'general'
 
 /** Result-parser ids that ship with the plugin (spelled here; the browser half cannot read host code). */
-const BUILT_IN_PARSERS = ['html-bing', 'html-ddg', 'json-generic']
+const BUILT_IN_PARSERS = ['html-bing', 'html-ddg', 'html-baidu', 'html-google', 'html-so360', 'json-generic']
 
 const hintStyle = {
   color: 'var(--dsw-alias-label-tertiary, #8b8b8b)',
@@ -168,6 +168,7 @@ export function Panel(props: PanelProps): JSX.Element {
           items={[
             { value: 'search', id: 'tab-search', label: t('tabSearch'), panelId: 'local-browser-web-panel' },
             { value: 'fetch', id: 'tab-fetch', label: t('tabFetch'), panelId: 'local-browser-web-panel' },
+            { value: 'proxy', id: 'tab-proxy', label: t('tabProxy'), panelId: 'local-browser-web-panel' },
             { value: 'clean', id: 'tab-clean', label: t('tabClean'), panelId: 'local-browser-web-panel' },
             { value: 'quality', id: 'tab-quality', label: t('tabQuality'), panelId: 'local-browser-web-panel' },
             { value: 'general', id: 'tab-general', label: t('tabGeneral'), panelId: 'local-browser-web-panel' },
@@ -209,6 +210,14 @@ export function Panel(props: PanelProps): JSX.Element {
             )
             : null}
           {tab === 'fetch' ? group('groupFetch') : null}
+          {tab === 'proxy'
+            ? (
+              <>
+                {group('groupProxy')}
+                <p style={hintStyle}>{t('proxyNote')}</p>
+              </>
+            )
+            : null}
           {tab === 'clean' ? group('groupClean') : null}
           {tab === 'quality' ? group('groupQuality') : null}
           {tab === 'general'

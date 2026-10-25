@@ -8,6 +8,7 @@
  */
 import { LocalBrowserWebError } from '../../errors.ts'
 import { httpGet, looksLikeChallenge } from '../../http.ts'
+import { httpProxyOf } from '../../proxy.ts'
 import { buildSearchUrl, searchLimits, type EngineRunner } from './context.ts'
 
 /** Retrieve and parse one engine's HTML SERP. */
@@ -20,6 +21,7 @@ export const httpHtmlRunner: EngineRunner = async (engine, query, ctx, signal) =
       ? {}
       : { 'accept-language': `${engine.extraParams.language};q=0.9` },
     limits: searchLimits(config),
+    proxy: httpProxyOf(config.proxy),
     ...signal === undefined ? {} : { signal },
   })
   if (looksLikeChallenge(result.statusCode, result.body)) {

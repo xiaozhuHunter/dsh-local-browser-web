@@ -89,6 +89,91 @@ function gatherParagraphs(document: Document): string {
 }
 
 /**
+ * Nesting depth above which the DOM is not parsed at all.
+ *
+ * Conversion and scoring both walk the tree recursively, and unclosed-tag
+ * nesting makes that walk superlinear while blocking the event loop past any
+ * cooperative timeout (measured on a 5 000-deep fixture: ~8 s, then
+ * `RangeError`). Real pages nest a few dozen levels; this is a robustness
+ * invariant, not a tunable.
+ */
+const MAX_DOM_DEPTH = 512
+
+/** Elements that never take a closing tag, so they do not grow the stack. */
+const VOID_ELEMENTS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr',
+])
+
+/** Whether the markup nests deeper than {@link MAX_DOM_DEPTH}. */
+function exceedsDepth(html: string): boolean {
+  const lower = html.toLowerCase()
+  const stack: string[] = []
+  let offset = 0
+  let inComment = false
+  while (offset < html.length) {
+    const start = html.indexOf('<', offset)
+    if (start === -1) break
+    if (inComment) {
+      const end = html.indexOf('-->', offset)
+      if (end === -1) break
+      inComment = false
+      offset = end + 3
+      continue
+    }
+    if (html.startsWith('<!--', start)) {
+      inComment = true
+      offset = start + 4
+      continue
+    }
+    let cursor = start + 1
+    const closing = html[cursor] === '/'
+    if (closing) cursor += 1
+    const nameStart = cursor
+    while (/[a-zA-Z0-9-]/u.test(html[cursor] ?? '')) cursor += 1
+    if (cursor === nameStart) {
+      offset = start + 1
+      continue
+    }
+    const name = lower.slice(nameStart, cursor)
+    let quote: string | undefined
+    while (cursor < html.length) {
+      const char = html[cursor]
+      cursor += 1
+      if (quote !== undefined) {
+        if (char === quote) quote = undefined
+      } else if (char === '"' || char === "'") {
+        quote = char
+      } else if (char === '>') {
+        break
+      }
+    }
+    if (html[cursor - 1] !== '>') break
+    if (closing) {
+      if (stack.at(-1) === name) stack.pop()
+    } else {
+      let last = cursor - 2
+      while (/\s/u.test(html.charAt(last))) last -= 1
+      if (!VOID_ELEMENTS.has(name) && html[last] !== '/') {
+        stack.push(name)
+        if (stack.length > MAX_DOM_DEPTH) return true
+      }
+    }
+    offset = cursor
+  }
+  return false
+}
+
+/** Strip tags without building a DOM: the only safe move when the markup is hostile. */
+function textWithoutDom(html: string): string {
+  return normalize(
+    html
+      .replace(/<(script|style|noscript)[^>]*>[\s\S]*?<\/\1>/giu, ' ')
+      .replace(/<[^>]*>/gu, ' '),
+  )
+}
+
+/**
  * Extract the main content of a rendered page.
  *
  * @param html - the rendered document.
@@ -97,6 +182,11 @@ function gatherParagraphs(document: Document): string {
  * @returns title, plain text, and a cleaned HTML fragment.
  */
 export function extractArticle(html: string, _url: string, options: ExtractOptions): ExtractedArticle {
+  // Refuse to build a DOM for markup that would blow the stack: the caller gets
+  // readable text instead of a very long block followed by a crash.
+  if (exceedsDepth(html)) {
+    return { title: undefined, text: textWithoutDom(html), html: '' }
+  }
   const dom = new JSDOM(html)
   try {
     const { document } = dom.window
