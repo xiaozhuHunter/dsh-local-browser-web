@@ -45,6 +45,9 @@ import { browserProxyOf, httpProxyOf } from './proxy.ts'
 import { LocalBrowserFetchProvider } from './providers/fetch.ts'
 import { LocalBrowserSearchProvider } from './providers/search.ts'
 import { LocalBrowserWebService } from './service.ts'
+import { registerBrowserControl } from './server/browser-control.ts'
+import { HttpRerankScorer } from './search/rerank.ts'
+import { ScorerRegistry } from './search/scorers.ts'
 import { applyLocalSearchTestTool } from './tools/local-search-test.ts'
 
 import type {} from '@deepseek-ai/dsh-credentials'
@@ -59,6 +62,15 @@ export { LocalBrowserSearchProvider } from './providers/search.ts'
 export { LocalBrowserFetchProvider } from './providers/fetch.ts'
 export { EngineRegistry } from './engines/registry.ts'
 export { FetchBackendRegistry } from './fetch/backends.ts'
+export { ScorerRegistry, blendScores } from './search/scorers.ts'
+export { HttpRerankScorer } from './search/rerank.ts'
+export type {
+  SearchScorer,
+  ScoreCandidate,
+  ScoreEvidence,
+  ScoreRequest,
+  ScoreResult,
+} from './search/scorers.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -161,6 +173,19 @@ export function apply(ctx: Context, config: Config): void {
     () => getConfig().structuredLog,
   )
 
+  // The built-in reranker is registered unconditionally: `searchScorer` selects
+  // it, and a selection is a volatile config change — making registration
+  // conditional would require a reload to turn it on.
+  const scorers = new ScorerRegistry()
+  scorers.register(new HttpRerankScorer(() => {
+    const current = getConfig()
+    return {
+      endpoint: current.rerankEndpoint,
+      model: current.rerankModel,
+      timeoutMs: current.rerankTimeoutMs,
+    }
+  }))
+
   const runner: RunnerContext = {
     config: getConfig,
     cdp,
@@ -185,7 +210,7 @@ export function apply(ctx: Context, config: Config): void {
   // provider without editing the `web` row's config. A toggle takes effect on the
   // next plugin (re)load — see README "已知限制".
   if (localSearch) {
-    ctx.web.registerSearchProvider(new LocalBrowserSearchProvider({ config: getConfig, registry: engines, runner, diagnostics }))
+    ctx.web.registerSearchProvider(new LocalBrowserSearchProvider({ config: getConfig, registry: engines, runner, diagnostics, scorers }))
   }
   if (localFetch) {
     ctx.web.registerFetchProvider(new LocalBrowserFetchProvider({ config: getConfig, backends, diagnostics }))
@@ -193,7 +218,23 @@ export function apply(ctx: Context, config: Config): void {
 
   applyLocalSearchTestTool(ctx, { registry: engines, runner, diagnostics })
 
-  new LocalBrowserWebService(ctx, { engines, parsers, backends, diagnostics })
+  new LocalBrowserWebService(ctx, { engines, parsers, backends, scorers, diagnostics })
+
+  // The panel's "detect and start" button: a named route on the web server, which
+  // is the supported path for a third-party plugin (a new Typert remote namespace
+  // would require editing DSH's client assembly). Profiles without a web server
+  // simply never get the route; the plugin and its providers still work.
+  registerBrowserControl(ctx, {
+    settings: () => {
+      const current = getConfig()
+      return {
+        endpoint: current.cdpEndpoint,
+        chromePath: current.chromePath,
+        profileDir: current.chromeProfileDir,
+        launchTimeoutMs: current.launchTimeoutMs,
+      }
+    },
+  })
 
   // The seam selects exactly one provider per capability, and a second usable
   // provider with no pin makes it throw WEB_PROVIDER_AMBIGUOUS. The `web` row's

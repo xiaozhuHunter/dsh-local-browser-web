@@ -18,6 +18,7 @@ import type { EngineRegistry } from './engines/registry.ts'
 import type { ParserRegistry } from './engines/parsers.ts'
 import type { FetchBackendRegistry } from './fetch/backends.ts'
 import type { Diagnostics, OperationRecord } from './log.ts'
+import type { SearchScorer, ScorerRegistry } from './search/scorers.ts'
 import type { EngineSpec, FetchBackend, ResultParser } from './types.ts'
 
 /** What the service needs from the plugin instance. */
@@ -25,6 +26,7 @@ export interface LocalBrowserWebDeps {
   engines: EngineRegistry
   parsers: ParserRegistry
   backends: FetchBackendRegistry
+  scorers: ScorerRegistry
   diagnostics: Diagnostics
 }
 
@@ -72,6 +74,21 @@ export class LocalBrowserWebService extends Service {
    */
   registerFetchBackend(id: string, backend: FetchBackend): () => void {
     return this.deps.backends.register(id, backend)
+  }
+
+  /**
+   * Register a result scorer (a reranker, or an evidence extractor such as a
+   * local 7B). Selecting it is a config change (`searchScorer`), not a reload.
+   * @param scorer - the strategy.
+   * @returns the disposer removing it.
+   */
+  registerScorer(scorer: SearchScorer): () => void {
+    return this.deps.scorers.register(scorer)
+  }
+
+  /** Every registered scorer id. */
+  scorers(): string[] {
+    return this.deps.scorers.ids()
   }
 
   /** Every engine in dispatch order (configured plus runtime-registered). */

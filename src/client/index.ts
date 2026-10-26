@@ -26,10 +26,13 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import { Panel } from './Panel.tsx'
+import { BrowserControl } from './browserControl.ts'
 import { ENTRY_ID, NS, PanelForm, panelFace } from './controller.ts'
 import { en, zh, type PanelLocaleKey } from './locales.ts'
 
-export type { CredentialState, EngineView, FieldDef, PanelState } from './controller.ts'
+export type { BrowserStatusView, CredentialState, EngineView, FieldDef, PanelState } from './controller.ts'
+export { BROWSER_CONTROL_PATH } from './browserControl.ts'
+export { BrowserControl } from './browserControl.ts'
 export { ENTRY_ID, NS } from './controller.ts'
 export { Panel } from './Panel.tsx'
 
@@ -53,6 +56,7 @@ export function apply(ctx: ClientContext): void {
 
   const form = new PanelForm(ctx.configForms.get<Record<string, unknown>>(ENTRY_ID), ctx)
   ctx.effect(() => () => { form.dispose() }, 'local-browser-web: form subscription')
+  const browser = new BrowserControl()
 
   // A key can be written from another surface (the Models page addresses the same
   // reference) and the settings section does not change when it is, so the whole
@@ -69,7 +73,7 @@ export function apply(ctx: ClientContext): void {
       order: 60,
       label: () => t('title'),
       locale: NS,
-      inject: () => panelFace(form),
+      inject: () => panelFace(form, browser),
     }, Panel))),
     'local-browser-web: settings section',
   )

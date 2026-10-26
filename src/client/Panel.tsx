@@ -10,12 +10,12 @@
  *
  * @module dsh-local-browser-web/client/Panel
  */
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { SettingsForm, SettingsValueField, SegmentedTabs } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SettingsFieldState } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
-import { FIELD_GROUPS, type FieldDef, type PanelActions, type PanelFace, type PanelState } from './controller.ts'
+import { FIELD_GROUPS, type BrowserStatusView, type FieldDef, type PanelActions, type PanelFace, type PanelState } from './controller.ts'
 import { FieldShell, LinesField, SelectField, ToggleField } from './controls.tsx'
 import { EnginesEditor } from './EnginesEditor.tsx'
 import { ImportExport } from './ImportExport.tsx'
@@ -125,6 +125,83 @@ function Group(
 }
 
 /**
+ * The Chrome connection card: live state plus the two actions.
+ *
+ * Status is fetched once on mount (the panel should not lie about a port it has
+ * not checked) and after every click. Nothing here touches the config form.
+ */
+function BrowserCard(props: {
+  t: Translate<PanelLocaleKey>
+  disabled: boolean
+  onStatus: () => Promise<BrowserStatusView>
+  onLaunch: () => Promise<BrowserStatusView>
+}): ReactNode {
+  const [busy, setBusy] = useState<'idle' | 'check' | 'launch'>('idle')
+  const [status, setStatus] = useState<BrowserStatusView | undefined>(undefined)
+
+  const run = async (mode: 'check' | 'launch'): Promise<void> => {
+    setBusy(mode)
+    try {
+      setStatus(mode === 'check' ? await props.onStatus() : await props.onLaunch())
+    } finally {
+      setBusy('idle')
+    }
+  }
+
+  useEffect(() => {
+    void run('check')
+    // Mount-only: the endpoint can change on save, and the next click re-reads it.
+  }, [])
+
+  const stateText = status === undefined
+    ? props.t('browserUnknown')
+    : status.running ? props.t('browserRunning') : props.t('browserStopped')
+  const stateColor = status === undefined
+    ? 'var(--dsw-alias-label-tertiary, #8b8b8b)'
+    : status.running ? 'var(--dsw-alias-label-success, #2e7d32)' : 'var(--dsw-alias-label-error, #c0392b)'
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <h3 style={{ fontSize: 13, margin: '0 0 4px' }}>{props.t('browserTitle')}</h3>
+      <p style={hintStyle}>{props.t('browserHint')}</p>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '0 0 8px' }}>
+        <span style={{ color: stateColor, fontSize: 12, fontWeight: 600 }}>● {stateText}</span>
+        {status?.running === true && status.browser !== undefined
+          ? <span style={{ fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #8b8b8b)' }}>{status.browser}</span>
+          : null}
+        {status !== undefined && status.endpoint.length > 0
+          ? <span style={{ fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #8b8b8b)' }}>{status.endpoint}</span>
+          : null}
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button type="button" disabled={props.disabled || busy !== 'idle'} onClick={() => { void run('check') }}>
+          {busy === 'check' ? props.t('browserChecking') : props.t('browserCheck')}
+        </button>
+        <button type="button" disabled={props.disabled || busy !== 'idle'} onClick={() => { void run('launch') }}>
+          {busy === 'launch' ? props.t('browserLaunching') : props.t('browserLaunch')}
+        </button>
+      </div>
+      {status !== undefined && !status.running && status.message !== undefined
+        ? <p style={noticeStyle}>{status.message}</p>
+        : null}
+      {status !== undefined && !status.running && status.searched.length > 0
+        ? (
+          <details style={{ marginTop: 6 }}>
+            <summary style={{ fontSize: 12, cursor: 'pointer' }}>{props.t('browserSearched')}</summary>
+            <ul style={{ fontSize: 12, margin: '6px 0 0', paddingLeft: 18 }}>
+              {status.searched.map(path => <li key={path}><code>{path}</code></li>)}
+            </ul>
+          </details>
+        )
+        : null}
+      {status?.running === true
+        ? <p style={hintStyle}>{props.t('browserRunningNote')}</p>
+        : null}
+    </div>
+  )
+}
+
+/**
  * Render the plugin's settings page.
  * @param props - the page's locale seat, the form face, and the owner's `close`.
  * @returns the section body.
@@ -209,7 +286,19 @@ export function Panel(props: PanelProps): JSX.Element {
               </>
             )
             : null}
-          {tab === 'fetch' ? group('groupFetch') : null}
+          {tab === 'fetch'
+            ? (
+              <>
+                <BrowserCard
+                  t={t}
+                  disabled={disabled}
+                  onStatus={props.browserStatus}
+                  onLaunch={props.launchBrowser}
+                />
+                {group('groupFetch')}
+              </>
+            )
+            : null}
           {tab === 'proxy'
             ? (
               <>

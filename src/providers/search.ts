@@ -18,6 +18,7 @@ import type { ConflictNote } from '../quality/conflict.ts'
 import { detectConflicts } from '../quality/conflict.ts'
 import { rankSources, type RankedSource } from '../quality/filter.ts'
 import { TIER_LABELS, tierOf } from '../quality/source-tiers.ts'
+import { blendScores, candidatesOf, type ScorerRegistry, type ScoreEvidence } from '../search/scorers.ts'
 import type { QualityVerdict, RawSearchSource } from '../types.ts'
 
 /** What the provider reads per operation. */
@@ -26,6 +27,7 @@ export interface SearchProviderDeps {
   registry: EngineRegistry
   runner: RunnerContext
   diagnostics: Diagnostics
+  scorers: ScorerRegistry
 }
 
 /** Union the per-source flags and take the floor score, so one record tells the whole story. */
@@ -132,6 +134,61 @@ export class LocalBrowserSearchProvider implements WebSearchProvider {
   }
 
   /**
+   * Run the configured scorer, if one is selected.
+   *
+   * A scorer is an enrichment, never a gate: an unregistered id, an unreachable
+   * endpoint, or a malformed answer all leave the quality ordering untouched and
+   * the full result set intact. The failure goes to the diagnostics ring, where
+   * `local_search_test recent:true` can show it without a log dive.
+   *
+   * @param config - one resolved config snapshot.
+   * @param ranked - sources in quality order.
+   * @param query - the query being answered.
+   * @param signal - caller cancellation.
+   * @param started - when the search began, for the diagnostic record.
+   * @returns the final order plus any claims an evidence scorer extracted.
+   */
+  private async applyScorer(
+    config: ResolvedConfig,
+    ranked: RankedSource[],
+    query: string,
+    signal: AbortSignal | undefined,
+    started: number,
+  ): Promise<{ ordered: RankedSource[], evidence?: readonly ScoreEvidence[] }> {
+    const id = config.searchScorer.trim()
+    if (id.length === 0 || ranked.length === 0) return { ordered: ranked }
+    const scorer = this.deps.scorers.get(id)
+    if (scorer === undefined) {
+      this.deps.diagnostics.record({
+        at: Date.now(),
+        kind: 'search',
+        target: query,
+        elapsedMs: Date.now() - started,
+        code: 'SCORER_UNAVAILABLE',
+        message: `未注册的评分器：${id}`,
+      })
+      return { ordered: ranked }
+    }
+    try {
+      const result = await scorer.score({ query, candidates: candidatesOf(ranked) }, signal)
+      // An `evidence` scorer (a local extractor) deliberately does not reorder:
+      // its output is material for a later comparison stage, not a verdict.
+      const ordered = scorer.kind === 'rerank' ? blendScores(ranked, result.scores) : ranked
+      return result.evidence === undefined ? { ordered } : { ordered, evidence: result.evidence }
+    } catch (error) {
+      this.deps.diagnostics.record({
+        at: Date.now(),
+        kind: 'search',
+        target: query,
+        elapsedMs: Date.now() - started,
+        code: 'SCORER_FAILED',
+        message: `${scorer.label}: ${error instanceof Error ? error.message : String(error)}`,
+      })
+      return { ordered: ranked }
+    }
+  }
+
+  /**
    * Run one query through the enabled engines.
    * @param request - the query (the seam applies `maxResults` to the result).
    * @param signal - cancellation forwarded to every engine.
@@ -151,6 +208,8 @@ export class LocalBrowserSearchProvider implements WebSearchProvider {
         signal,
       )
       const ranked = rankSources(outcome.sources, config.quality)
+      const applied = await this.applyScorer(config, ranked, request.query, signal, started)
+      const ordered = applied.ordered
       const conflicts = config.quality.conflict.enabled
         ? detectConflicts(outcome.sources)
         : new Map<string, ConflictNote>()
@@ -161,7 +220,8 @@ export class LocalBrowserSearchProvider implements WebSearchProvider {
         target: request.query,
         elapsedMs: Date.now() - started,
         chars: outcome.sources.reduce((sum, source) => sum + (source.snippet?.length ?? 0), 0),
-        quality: aggregateVerdict(ranked),
+        quality: aggregateVerdict(ordered),
+        ...applied.evidence === undefined ? {} : { evidence: applied.evidence },
       })
       if (outcome.failures.length > 0) {
         // A partial fallback is worth knowing about even when the call succeeded.
@@ -178,7 +238,7 @@ export class LocalBrowserSearchProvider implements WebSearchProvider {
         }
       }
       return {
-        sources: ranked.map(({ source, quality }) => toSeamSource(
+        sources: ordered.map(({ source, quality }) => toSeamSource(
           source,
           config.quality.annotate.enabled
             ? withAnnotation(source, annotationOf(source, quality, conflicts.get(source.url)))

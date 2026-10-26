@@ -132,4 +132,21 @@ describe('validateConfig', () => {
   it('refuses a non-integer concurrency', () => {
     assert.match(failing(makeConfig({ maxConcurrency: 1.5 })).message, /maxConcurrency 必须为正整数/u)
   })
+
+  it('validates the rerank endpoint only when that scorer is selected', () => {
+    // Ignored while no scorer is selected, so a stale value cannot block a save.
+    assert.doesNotThrow(() => { validateConfig(makeConfig({ rerankEndpoint: 'not a url' }), PARSERS) })
+    assert.match(
+      failing(makeConfig({ searchScorer: 'rerank-http', rerankEndpoint: 'not a url' })).message,
+      /rerankEndpoint 不是合法 URL/u,
+    )
+    assert.match(
+      failing(makeConfig({ searchScorer: 'rerank-http', rerankEndpoint: 'ftp://127.0.0.1/rerank' })).message,
+      /rerankEndpoint 协议不支持/u,
+    )
+    assert.match(
+      failing(makeConfig({ searchScorer: 'rerank-http', rerankTimeoutMs: 100 })).message,
+      /rerankTimeoutMs 必须不小于 500/u,
+    )
+  })
 })

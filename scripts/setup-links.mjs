@@ -33,6 +33,8 @@ const LINKS = {
   '@deepseek-ai/dsh-credentials': join(REPO, 'packages/credentials/credentials'),
   '@deepseek-ai/dsh-launch-environment': join(REPO, 'packages/util/launch-environment'),
   '@deepseek-ai/dsh-util-values': join(REPO, 'packages/util/values'),
+  '@deepseek-ai/dsh-host-webserver': join(REPO, 'packages/host/webserver'),
+  '@deepseek-ai/dsh-system-prompt': join(REPO, 'packages/core/system-prompt'),
 
   // ── browser halves and their type faces ──────────────────────────────────
   '@deepseek-ai/dsh-client-ui-settings': join(REPO, 'packages/client/ui-settings'),

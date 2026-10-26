@@ -91,12 +91,12 @@ describe('Config schema volatility', () => {
   it('enumerates exactly the expected field count', () => {
     // A count check makes an accidental addition or deletion visible even when the
     // two sides are edited consistently but wrongly.
-    assert.equal(volatileLeaves(Config as unknown as SchemaNode).length, 47)
-    assert.equal(panelPaths().length, 46)
+    assert.equal(volatileLeaves(Config as unknown as SchemaNode).length, 54)
+    assert.equal(panelPaths().length, 53)
   })
 
   it('covers each declared group', () => {
-    assert.deepEqual(FIELD_GROUPS.map(group => group.fields.length), [4, 11, 5, 6, 18, 2])
+    assert.deepEqual(FIELD_GROUPS.map(group => group.fields.length), [8, 14, 5, 6, 18, 2])
     // Field ids must be unique: they become DOM ids.
     const ids = FIELD_GROUPS.flatMap(group => group.fields.map(field => field.id))
     assert.equal(new Set(ids).size, ids.length)

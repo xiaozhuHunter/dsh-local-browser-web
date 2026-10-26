@@ -9,8 +9,32 @@
 
 ---
 
+## 前置依赖：本机 Chrome
+
+**本插件不自带浏览器，也不会替你下载 Chrome。** `browser` 类引擎（百度、Google、百度桌面端）与 `cdp` 抓取后端都需要一台**监听了调试端口**的 Chrome。没有它时：搜索会回退到 HTTP 引擎（Bing / DuckDuckGo / 360 仍可用），抓取会直接报 `BROWSER_UNAVAILABLE`。
+
+推荐做法：**设置 → 本地浏览器 Web → 抓取 → 「检测并启动」**。它会先探测 `cdpEndpoint`；未连接时自动找到本机 Chrome，用插件自有的数据目录启动，并等到端口真正响应后才给出结果——不需要打开终端。
+
+等价的命令行（macOS）：
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.dsh/local-browser-web/chrome-profile"
+```
+
+- **Chrome 136+ 必须给独立数据目录**：在默认数据目录上加 `--remote-debugging-port` 会被静默忽略，端口根本不开。这也是「检测并启动」不复用你日常 profile 的原因。
+- Windows：`chrome.exe --remote-debugging-port=9222 --user-data-dir=%LOCALAPPDATA%\dsh\local-browser-web\chrome-profile`
+- Linux：`google-chrome --remote-debugging-port=9222 --user-data-dir=~/.dsh/local-browser-web/chrome-profile`
+- 这个实例可以和日常 Chrome 同时运行；登录态只存在该目录里。在里面登录一次 Google / 百度，能显著降低 `browser` 类引擎遇到验证码的概率。
+- 想让它随终端自动后台启动，可以把上面的命令写进 `~/.zshrc`（或用 LaunchAgent）。端口已经监听时，插件只会报告「已连接」，不会重复启动。
+- 自动检测只覆盖常见安装位置。Chrome 装在别处（或用的是 Chromium）时，在设置页填「Chrome 可执行文件」即可。
+
+---
+
 ## 目录
 
+- [前置依赖：本机 Chrome](#前置依赖本机-chrome)
 - [能力总览](#能力总览)
 - [内置引擎](#内置引擎)
 - [出网代理](#出网代理)
@@ -18,6 +42,7 @@
 - [GUI 入口与界面操作](#gui-入口与界面操作)
 - [在界面中添加自定义引擎](#在界面中添加自定义引擎)
 - [设置字段含义与默认值](#设置字段含义与默认值)
+- [结果重排与本地模型接口](#结果重排与本地模型接口)
 - [手动编辑 cordis.patch.yml](#手动编辑-cordispatchyml)
 - [回退到 deepseek-official](#回退到-deepseek-official)
 - [本地浏览器依赖与 CDP 连接](#本地浏览器依赖与-cdp-连接)
@@ -40,6 +65,7 @@
 | **抓取后端注册表** | `cdp`（默认，连本机 Chrome）/ `playwright`（可选）/ `http`（纯传输）；可注册新后端。 |
 | **质量过滤** | 来源分层（政府/学术/官方项目/媒体/参考/社区/聚合站）+ 一手性 + 时效 + 伪装检测 + 薄内容 / SEO 垃圾 / 低质 AIGC / 域名信誉，逐条可开关、阈值可调、总有总开关。 |
 | **来源标注与冲突并排** | 把来源性质、一手/二手、发布日期、与其他来源的数值分歧写进结果 `summary`，模型直接可见。 |
+| **评分器（可选）** | 规则排序之后、交给模型之前的可插拔一层：内置 `rerank-http`（cross-encoder 重排，60/40 与质量分混合）；`evidence` 类型专门留给本地 7B 做结构化证据抽取。默认关闭，失败自动退回原排序，且永不丢结果。 |
 | **设置页** | 挂在 `settings.section` 槽位的独立导航页，覆盖全部可调项；保存经 `form.mutate` 写入 profile 条目 `config` 并由 volatile HMR 热更新。 |
 | **Agent 工具** | `local_search_test`：真实测试每个引擎并报告失败阶段；也可只读最近的操作诊断。 |
 
@@ -203,10 +229,15 @@ dsh web --profile local-browser-web-dev --patch <本目录>/cordis.patch.yml
 
 ### 5. 启动本机 Chrome 的调试端口
 
+**优先用界面**：设置 → 本地浏览器 Web → 抓取 → 「检测并启动」。手动启动（macOS）：
+
 ```bash
-# macOS
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.dsh/local-browser-web/chrome-profile"
 ```
+
+Chrome 136+ 必须带独立 `--user-data-dir`，否则端口不会开——原因与各平台命令见文首「前置依赖：本机 Chrome」。
 
 ### Windows 安装补充
 
@@ -232,7 +263,8 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir=E:\dsh-plugins\.chrome-c
 设置（侧栏齿轮 / 设置快捷键）
 └── 左侧导航：本地浏览器 Web        ← 本插件设置页
     ├── 搜索   （搜索设置 + 引擎注册表编辑器 + 测试方式说明）
-    ├── 抓取   （抓取设置）
+    ├── 抓取   （Chrome 连接卡片 + 抓取设置）
+    ├── 代理   （代理开关与直连名单）
     ├── 清洗   （四阶段开关）
     ├── 质量过滤（规则开关 / 阈值 / 域名列表）
     └── 通用   （日志 + 配置导出/导入）
@@ -240,9 +272,12 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir=E:\dsh-plugins\.chrome-c
 
 页面内所有控件都是**暂存式**：改动先进入草稿，点「保存」才作为**一次原子写**提交。保存成功后草稿清空并从 Host 回读。
 
+**例外**是抓取页顶部的 Chrome 连接卡片：它不是配置项，点「检测」「检测并启动」会立即发一次请求并刷新状态，不需要保存。
+
 | 想做的事 | 操作位置 |
 | --- | --- |
 | 调调度模式 / 并发上限 / 超时 | 搜索 → 搜索设置 |
+| **检测 / 启动监听 9222 的 Chrome** | 抓取 → Chrome 调试端口 → 「检测」/「检测并启动」 |
 | 增删改引擎、调顺序、启停 | 搜索 → 搜索引擎注册表 |
 | 为引擎录入 API key | 搜索引擎注册表 → 该引擎行 → 「引擎凭据」 |
 | 测试某个引擎 | 搜索引擎注册表 → 该引擎行 → 「测试连接」（见下） |
@@ -251,9 +286,22 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir=E:\dsh-plugins\.chrome-c
 | 调质量阈值 / 改域名黑白名单 / 一键旁路 | 质量过滤 |
 | 日志级别 / 导出导入配置 | 通用 |
 
+### Chrome 连接卡片
+
+抓取页顶部会显示当前 CDP 端点的实时状态，并提供两个按钮：
+
+| 按钮 | 行为 |
+| --- | --- |
+| **检测** | 只请求 `GET <cdpEndpoint>/json/version`，不启动任何进程。已连接时显示浏览器版本；未连接时显示失败原因。 |
+| **检测并启动** | 先检测；未连接则按「Chrome 可执行文件」→ 自动检测顺序找到 Chrome，用「Chrome 数据目录」（留空则为插件自有目录）以 `--remote-debugging-port` 启动，并轮询直到端口响应或超出「启动等待预算」。 |
+
+失败时会直接给出可操作的信息：找不到 Chrome 时列出**已经尝试过的所有路径**；启动了但端口没响应时提示「同一数据目录可能已有 Chrome 在运行，请先完全退出它」。
+
+> 为什么面板能启动 Chrome、却不能真实测试引擎：DSH 的 `ctx.remote` 端点需要 typert 代码生成管线，独立仓库的插件无法接入；但 Host 可以按官方方式在 `webServer` 上注册具名路由。Chrome 控制就走这条路由（`POST /local-browser-web/browser`，先经 `connection` 服务的 Host/Origin 与登录令牌校验），而引擎测试涉及结果解析，仍然交给 agent 工具，见下。
+
 ### 引擎「测试连接」怎么用
 
-设置面板运行在**浏览器**里，无法执行 Host 代码：DSH 的 `ctx.remote` 端点需要 typert 代码生成管线，独立仓库的插件无法接入。因此该按钮不做真实网络请求，而是给出**可直接在会话里运行的 agent 工具调用**并支持一键复制：
+设置面板运行在**浏览器**里。除上面那条 Chrome 控制路由外，它没有通用的 Host 调用通道：DSH 的 `ctx.remote` 端点需要 typert 代码生成管线，独立仓库的插件无法接入。因此引擎「测试连接」不做真实网络请求，而是给出**可直接在会话里运行的 agent 工具调用**并支持一键复制：
 
 ```
 local_search_test engine="bing"
@@ -301,6 +349,10 @@ local_search_test engine="bing"
 | `parallelMaxEngines` | `3` | 仅 `parallel` 生效，1–8，且不得超过已启用引擎数。 |
 | `searchTimeoutMs` | `20000` | 单引擎单次搜索预算，1000–120000 ms。 |
 | `engines` | Bing、DuckDuckGo、百度、百度桌面端（默认停用）、Google、360 | 引擎注册表内容。 |
+| `searchScorer` | 空 | 结果评分器 id（见「[结果重排与本地模型接口](#结果重排与本地模型接口)」）。空 = 只用质量规则；`rerank-http` = 内置 HTTP 重排器；也可填第三方 `registerScorer` 注册的 id。 |
+| `rerankEndpoint` | `http://127.0.0.1:8080/rerank` | 内置重排器的地址，`searchScorer=rerank-http` 时必须为合法 http(s) URL。 |
+| `rerankModel` | `BAAI/bge-reranker-v2-m3` | 重排服务认识的模型 id。 |
+| `rerankTimeoutMs` | `4000` | 单次重排预算，500–30000 ms；超时按失败降级（原排序不变）。 |
 
 ### 抓取
 
@@ -313,6 +365,9 @@ local_search_test engine="bing"
 | `headless` | `true` | 仅 Playwright 后端；CDP 后端沿用你启动 Chrome 的方式。 |
 | `profileMode` | `shared` | `shared` 复用同一浏览器 profile（带登录态）/ `isolated` 每次新建隔离上下文。 |
 | `fetchTimeoutMs` | `45000` | 单次抓取（含渲染）预算。 |
+| `chromePath` | 空 | 「检测并启动」使用的 Chrome 可执行文件；留空自动检测常见位置。必须是绝对路径，否则保存被拒。 |
+| `chromeProfileDir` | 空 | 「检测并启动」使用的数据目录；留空为插件自有目录（`$DSH_HOME/local-browser-web/chrome-profile`）。必须是绝对路径。 |
+| `launchTimeoutMs` | `15000` | 启动后等待调试端口响应的预算，3000–60000 ms。 |
 | `maxConcurrency` | `2` | 并发抓取上限，1–8。 |
 | `maxResponseBytes` | `5000000` | 响应体字节上限；超过直接报 `CONTENT_TOO_LARGE`，不做部分读取。 |
 | `maxBodyChars` | `100000` | 解码后字符上限；超出截断并标记 `truncated`。 |
@@ -400,6 +455,85 @@ local_search_test engine="bing"
 
 ---
 
+## 结果重排与本地模型接口
+
+质量层只按规则排序（来源分层、一手性、时效、伪装、冲突），它不知道「这段摘要到底答不答这个问句」。补这一层需要一个小模型，插件把它做成**可插拔评分器**（`SearchScorer`），默认全部关闭。
+
+```
+检索 → 规则层（排序 + 来源标注，全部结果保留）
+     → [可选] reranker 重排（cross-encoder，0.6B 量级，60/40 与质量分混合）
+     → [可选] evidence 评分器（7B 只抽主张/数值，不改顺序、不判真假）
+     → 云端模型裁决
+```
+
+三条硬约束（实现与测试都钉住了）：
+
+- **只排序不丢弃**：评分器改的是顺序，结果条数永远不变；`top_n` 截断时缺失项一律排在最后而不是被删。
+- **失败即降级**：未注册 → `SCORER_UNAVAILABLE`；异常/超时/响应不可解析 → `SCORER_FAILED`；两者都保留原排序并进诊断环（`local_search_test recent:true`）。
+- **可整体旁路**：`searchScorer` 留空就等于没有这一层，行为与之前完全一致。
+
+### 内置重排器：`rerank-http`
+
+用 **cross-encoder** 而不是生成式模型：一次前向打分，比让 7B 生成判断便宜一到两个数量级，且分数可直接比较。服务端兼容两种主流响应协议：
+
+| 服务 | 响应形状 |
+| --- | --- |
+| Text Embeddings Inference（`POST /rerank`，bge / mxbai） | `[{ "index": 0, "score": 0.93 }, …]` |
+| Cohere / Jina / Infinity | `{ "results": [{ "index": 0, "relevance_score": 0.93 }, …] }` |
+
+请求体固定为：
+
+```json
+{ "model": "BAAI/bge-reranker-v2-m3", "query": "原查询", "documents": ["标题\n摘要", "…"], "top_n": 10 }
+```
+
+起一个本地服务的例子（CPU 也能跑，模型约 0.6B）：
+
+```bash
+docker run --rm -p 8080:80 -v "$PWD/models:/data" \
+  ghcr.io/huggingface/text-embeddings-inference:cpu-latest \
+  --model-id BAAI/bge-reranker-v2-m3
+```
+
+然后把设置页的 `searchScorer` 填 `rerank-http`、`rerankEndpoint` 指向 `http://127.0.0.1:8080/rerank` 即可（volatile，保存即生效，不必重启）。
+
+**混合方式**：`blendScores()` 把「规则质量分」与「重排分」各自做 min-max 归一化后按 `0.6 × 相关性 + 0.4 × 质量` 相加，稳定排序（同分保持原相对次序）。权重给相关性更高是刻意的——质量分已经写进了来源标注，重排补的是「和这个问句有多相关」。只给权重而不直接覆盖，是为了不让一个只见过标题和摘要的 cross-encoder 推翻「这是政府/一手来源」这类结构性证据。
+
+### 7B 证据抽取接口（预留，不内置模型）
+
+**不要**让本地 7B 判真伪：它没有额外检索能力，只能复述摘要，判决质量和「让云端模型自己看」没有区别，却多了一次本地推理。它真正有价值的地方是**结构化抽取**——把散在多个来源里的主张、版本号、日期、金额抽成可比对的条目，交给云端模型裁决。
+
+接口已经预留好了形状：`kind: 'evidence'` 的评分器，其 `scores` 被忽略（不改顺序），`evidence` 进诊断记录。注册一个即可：
+
+```ts
+ctx.effect(() => ctx.localBrowserWeb.registerScorer({
+  id: 'evidence-7b',
+  label: 'Local 7B evidence extractor',
+  kind: 'evidence',
+  async score({ query, candidates }, signal) {
+    const response = await fetch('http://127.0.0.1:8081/extract', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query, sources: candidates }),
+      signal,
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const body = await response.json() as { items?: ScoreEvidence[] }
+    return { scores: candidates.map(() => 0), evidence: body.items ?? [] }
+  },
+}), 'acme: evidence-7b')
+```
+
+服务端要返回的形状（`claim` 必须有，其余可省）：
+
+```json
+{ "items": [{ "claim": "最新版本", "value": "2.4.0", "sourceUrl": "https://example.com/releases" }] }
+```
+
+产出落在两条出口：结构化日志行的 `evidence=<条数>`，以及 `local_search_test recent:true` 返回记录里的 `evidence` 数组。它**不进 seam 的结果对象**——`WebSearchSource` 是 `dsh-web` 持有的封闭形状（同 D7）。要把它带给模型，最省事的方式是在你自己的调用侧读诊断环，或让评分器自己把结论写进 `snippet`／另走一条工具。
+
+---
+
 ## 手动编辑 cordis.patch.yml
 
 **界面保存与手动编辑通往同一处。** 界面上的每一次保存，都是通过 DSH 的配置表单服务 `ctx.configForms.get('local-browser-web')` → `form.mutate(ops, revision)` 提交，最终落到当前 profile 的 `cordis.patch.yml` 中本插件条目的 `config`，再由 volatile HMR 热更新到插件实例（无需重启）。因此：
@@ -465,9 +599,12 @@ ctx.effect(() => ctx.localBrowserWeb.registerEngine({ ...spec, id: 'searxng-cust
 
 // 新增抓取后端
 ctx.effect(() => ctx.localBrowserWeb.registerFetchBackend('my-renderer', backend), 'acme-search: backend')
+
+// 新增结果评分器（重排或证据抽取，见「结果重排与本地模型接口」）
+ctx.effect(() => ctx.localBrowserWeb.registerScorer(scorer), 'acme-search: scorer')
 ```
 
-只读面：`engines()` / `resultParsers()` / `fetchBackends()` / `recentDiagnostics(limit?, onlyFailures?)`。
+只读面：`engines()` / `resultParsers()` / `fetchBackends()` / `scorers()` / `recentDiagnostics(limit?, onlyFailures?)`。
 
 `RunnerContext.runners` 也允许按 `kind` 替换执行器（自带传输、录制回放的部署可用）。
 
@@ -488,6 +625,8 @@ ctx.effect(() => ctx.localBrowserWeb.registerFetchBackend('my-renderer', backend
 | `ENGINE_CONFIG_INVALID` | 自定义引擎元数据不合法（缺字段、endpoint 不可解析、解析策略未注册、id 重复） |
 | `ENGINE_TEST_FAILED` | 测试连接失败（含 `dns`/`http`/`parse`/`credential` 阶段归类） |
 | `NO_ENABLED_ENGINE` | 所有引擎被禁用，无可执行引擎 |
+| `SCORER_UNAVAILABLE` | `searchScorer` 指向的 id 没有注册（结果照常返回，只记诊断） |
+| `SCORER_FAILED` | 评分器抛错/超时/响应不可解析（结果照常返回，原排序不变） |
 | `FORM_REVISION_CONFLICT` | 面板保存命中版本冲突（内部为 Host 的 `SETTINGS_CONFLICT`，面板以界面语义码提示并保留草稿） |
 
 ---
@@ -504,7 +643,7 @@ node --experimental-transform-types --test tests/*.test.ts     # 单测
 
 需要 **Node 22**（`nvm use 22`）：仓库要求 `^22.19 || >=24`；测试用到构造器参数属性，因此要 `--experimental-transform-types`（仅剥类型的 `--experimental-strip-types` 不支持）。
 
-测试覆盖（217 例，全绿）：**schema/面板字段双射**（`schema 的 volatile 叶子 == 面板字段路径 + {engines}`，见 D8）、config 校验分支、引擎注册表增删改排序、三个内置解析器（含 URL 归一化、DDG 跳转解包、Google `/goto?` 放行、百度推广位过滤）、解析策略就绪条件声明、`browser` runner 的重试次数（恰好一次）、`bail`/`parallel` 调度与去重、质量规则（来源分层梯度、一手/二手、时效、伪装、摘要与正文双阈值）与排序稳定性、跨源冲突检测的「该报」与「不该报」两侧、来源标注的可见契约（含长摘要不挤掉标注）、传输层守卫（SSRF / 协议 / 内容类型 / 人机验证）、正文提取与 Markdown、**与内置渲染路径的清洗一致性**（字符集解码、GFM 表格 / 删除线 / 隐藏元素、嵌套深度防护）、四阶段管线各开关与失败码（含「上限作用在清洗后的输出」与「提取拒绝 markup 后继续走文本」），以及**客户端 bundle 冒烟测试**（加载 `lib/client.js`，校验 Lazy-CJS factory 契约、`settings.section` 注册、注入面字段表覆盖）。
+测试覆盖（258 例，全绿）：**schema/面板字段双射**（`schema 的 volatile 叶子 == 面板字段路径 + {engines}`，见 D8）、config 校验分支、引擎注册表增删改排序、三个内置解析器（含 URL 归一化、DDG 跳转解包、Google `/goto?` 放行、百度推广位过滤）、解析策略就绪条件声明、`browser` runner 的重试次数（恰好一次）、`bail`/`parallel` 调度与去重、质量规则（来源分层梯度、一手/二手、时效、伪装、摘要与正文双阈值）与排序稳定性、跨源冲突检测的「该报」与「不该报」两侧、来源标注的可见契约（含长摘要不挤掉标注）、传输层守卫（SSRF / 协议 / 内容类型 / 人机验证）、正文提取与 Markdown、**与内置渲染路径的清洗一致性**（字符集解码、GFM 表格 / 删除线 / 隐藏元素、嵌套深度防护）、四阶段管线各开关与失败码（含「上限作用在清洗后的输出」与「提取拒绝 markup 后继续走文本」）、**评分器接缝**（注册表语义、混排不丢源、长度不匹配/NaN 回退、TEI 与 Cohere 两种响应协议、`top_n` 截断排最后、provider 侧重排与 `SCORER_FAILED`/`SCORER_UNAVAILABLE` 降级、evidence 不改顺序且进诊断环），以及**客户端 bundle 冒烟测试**（加载 `lib/client.js`，校验 Lazy-CJS factory 契约、`settings.section` 注册、注入面字段表覆盖）。
 
 ---
 
@@ -527,7 +666,9 @@ node --experimental-transform-types --test tests/*.test.ts     # 单测
 | D10 | （追加需求）新增百度 / Google / 360 搜索 | 三家作为**引擎条目 + 解析策略**加入，而不是新增代码路径：`html-baidu` / `html-google` / `html-so360` 进解析器注册表，引擎只是 `DEFAULT_ENGINES` 的条目；另加 `SEARCH_BODY_CHARS` 与「SERP 命中人机验证即抛 `WEB_FETCH_CHALLENGE`」两条修正 | 计划里「引擎是数据不是代码路径」这条约束必须继续成立；同时实测暴露两个必须修的缺陷：360 的结果在 330 KB 之后（被 `maxBodyChars` 截断成 0 条），百度桌面端把验证页当 200 返回（会被误报成「0 条结果」）。 |
 | D12 | （装好代理后首次实跑，Google 10 条结果解析为 0） | 查出四个独立缺陷，全部按「数据/策略声明」修，不新增执行分支：① **UA** 默认值原本是插件标识 `deepseek-harness-local-browser/0.1.0`，浏览器渲染也用它覆盖 → 引擎判定为爬虫，Google 回「需启用 JavaScript」降级页（87 KB，`#rso` 不存在）。改为：浏览器通道**不再覆盖 UA**（用本机 Chrome 真身），HTTP 通道留空时回落到真实桌面 Chrome UA。② **就绪条件**：`loadEventFired` 会早于结果注入触发（实测空壳 `body` 仅 17 字符，`#rso` 在 2.5s 后才出现），给 `ResultParser` 加 `waitFor` 声明，渲染后端据此等待（8s 上限，超时照读）；`loadEventFired` 自身也加 8s 软上限（代理下挂住的第三方资源会让它永不到来）。③ **跳转解包**：Google 的 href 全变成 `/goto?url=<加密 token>`，真实地址不在 DOM 里；给 `EngineSpec` 加 `unwrapRedirect` 正则，命中的结果各发一次 HEAD 读 302 的 `Location`（并发 4、单条 6s、失败重试一次）。④ **DuckDuckGo** 主站在代理下渲染成空白（`body` 文本长度 0），改走 `html.duckduckgo.com/html/` 服务端渲染端点，`kind` 降为 `http-html` | 这四条都属于「引擎是数据、策略自带知识」的边界内：等待什么由解析策略声明，哪种链接需要解包由引擎条目声明。顺带修掉两个实测缺陷：`proxy.bypass` 命中时仍会建代理上下文（白白丢掉登录态，百度因此一直人机验证）、百度移动端把 `recommend_list` / `ubs` 推广位当结果收进来。 |
 | D13 | （要求「检查清洗功能能否取代官方」） | 逐项对照内置 `web-fetch-http` + `dsh-tool-web` 后补掉四处真实差距：① Markdown 规则与官方对齐（GFM 表格、删除线，剔除 `display:none` / `[hidden]` / `aria-hidden`）——原先整张表格被拆成一行一个单元格；② 字符集改为按 `Content-Type` 的 charset 解码并回退 `<meta charset>`——原先硬编码 UTF-8，GBK 页面整页替换字符；③ DOM 解析加 512 层嵌套上限，超限退化为纯文本——原先 5 000 层嵌套会阻塞事件循环 8.2 秒后 `RangeError`；④ 提取预算抬到 200 万字符、`maxBodyChars` 改为截断清洗后的输出——原先 562 KB 的维基页在 100 k 处被切，容器丢失后只抽出 1 905 字符（完整 HTML 下是 29 922） | 结论不是读代码得出的：把同一份 HTML 同时喂给真实的内置 provider/tool 渲染与插件管线（`compare-clean.mjs`、`compare-offline.mjs`），四条差距都是量出来的。新版新增 `tests/clean-parity.test.ts` 钉住前三条，管线测试钉住第四条。 |
+| D15 | （追加需求）Chrome 依赖要在 README 讲清，并提供「一键检测 + 启动」按钮，不让用户敲命令 | 新增 `src/browser/launcher.ts`（探测 `/json/version`、按平台定位可执行文件、独立数据目录、spawn 后轮询到端口响应）与 `src/server/browser-control.ts`（`POST /local-browser-web/browser`，actions：`status` / `launch`）；面板「抓取」页加连接卡片（状态 pill + 检测 / 检测并启动 + 失败路径列表）；配置新增 `chromePath` / `chromeProfileDir` / `launchTimeoutMs`；README 文首加「前置依赖：本机 Chrome」 | 面板无法用 `ctx.remote`（typert 需构建期装配，第三方插件接不进去），但 Host 可以按官方方式在 `webServer` 上注册具名路由（与 `open-in-app` 同一范式），并复用 `connection.requestRejection` 的 Host/Origin + 登录令牌校验。启动只允许「固定参数 + 插件自有数据目录」，不接受用户输入拼进命令行；Chrome 136+ 的默认目录限制是必须固定 `--user-data-dir` 的直接原因。 |
 | D14 | （要求「质量层能否甄别搜索结果的权威性与真伪」） | 实测证伪旧的 `authority` 规则后整体重做：① 权威度改为**来源分层**（政府 95 / 学术 88 / 项目官方 80 / 媒体 72 / 参考 66 / 社区 45 / 聚合站 25）+ 一手性 ±6，删除英文词表计数；② 接入 `publishedAt` 时效（原先该字段完全没参与打分）；③ 新增伪装检测（品牌被他人注册域借用 −40、明文 HTTP −5、短链 −3）；④ 搜索摘要改用独立的 `snippetMinChars`（原先把正文 200 字下限套在 50–120 字的摘要上，10/10 恒中 `thin-content`）；⑤ 新增跨源冲突检测与 `summary` 来源标注，把「来源性质 + 一手性 + 日期 + 与谁分歧」直接交给模型 | 旧规则三条硬伤都是量出来的：10 条真实结果只产出 **2 种判定**（9 条并列）；`candidate` 因含 `date` 被判有权威、`source source source updated date reference citation` 拿满分；中文权威正文（世卫报告句）被判 `low-authority`，因为 8 个提示词全是英文。修复后同一份 SERP 按真实发布者分成 3 层且语义正确，中文官方页拿 95 分。新增 `tests/source-tiers.test.ts`、`tests/conflict.test.ts` 钉住分层与「不误报冲突」。 |
+| D16 | （追加需求）先接入 reranker，并为本地 7B 预留接口 | 新增可插拔评分器接缝 `src/search/scorers.ts`（`SearchScorer`：`kind: 'rerank' \| 'evidence'`，`ScorerRegistry`，`blendScores()` 60/40 混合）与内置 `src/search/rerank.ts`（`rerank-http`，兼容 TEI 数组与 Cohere/Jina `results` 两种协议）；provider 在质量排序后调用 `applyScorer`，配置新增 `searchScorer` / `rerankEndpoint` / `rerankModel` / `rerankTimeoutMs`（全 volatile），面板「搜索」页可填，公开 API 增 `registerScorer()` / `scorers()`；`kind: 'evidence'` 的产出（`ScoreEvidence[]`）不改顺序，落到诊断记录与日志行 | 结论是权衡后的取舍：cross-encoder（0.6B）一次前向就给出可比分数，比让 7B 生成判决便宜一到两个数量级，因此**先接 reranker**；7B 只保留「结构化证据抽取」的位置，因为本地模型没有额外检索能力，让它判真假等于让云端模型自己看两遍。三条硬约束写成代码不变式：不丢弃、失败降级、可旁路。新增 `tests/scorers.test.ts`、`tests/rerank.test.ts`。 |
 
 ---
 
@@ -551,3 +692,9 @@ node --experimental-transform-types --test tests/*.test.ts     # 单测
 - **L16 字符集回退有边界**：`<meta charset>` 只读响应体前 4 KB，且仅在 `Content-Type` 未声明 charset 时生效；真正要按声明解码的页面（GBK 政府/院校老站）不受影响。
 - **L17 分层只看域名，不看页面归属**：`github.com/xxx/awesome-list` 属于第三方整理，但 `github.com` 整域按「项目官方」计入一手。同理 `*.gov.cn` 上转载的第三方内容也按官方计。判断「这条 repo 是不是项目官方」需要 owner 级规则，当前不做。
 - **L18 冲突检测只比标题里的数值**：同一话题的两个来源若把版本号/日期/比例写在摘要而非标题里，检测不到（宁可不报也不误报）。跨语言、跨单位（`1.5 万` vs `15000`）也不做归一。
+- **L19 「检测并启动」启动的是 Host 所在机器上的 Chrome**：DSH 跑在远端（SSH / 容器 / 无图形界面的服务器）时，按钮只会在那台机器上找 Chrome；远端没有浏览器时仍然报 `CHROME_NOT_FOUND`，此时应在本地起 CDP 并用隧道暴露端口，再把 `cdpEndpoint` 指过去。
+- **L20 自动检测只覆盖 Google Chrome 的常规安装位置**：Chromium、Edge（`msedge.exe` 也能开 CDP，但需手动填路径）、自定义目录都检测不到，请填 `chromePath`。启动参数是固定的四项（端口 / 数据目录 / `--no-first-run` / `--no-default-browser-check`），不提供自定义 argv。
+- **L21 重排只看得见标题与摘要**：`rerank-http` 的输入是 `标题\n摘要`，不是正文。摘要由搜索页给出（通常 50–120 字），所以「正文里其实答了这个问题但摘要没写」的结果会被压后。要让重排看正文，得先 fetch 再自建一条评分链路，插件不做。
+- **L22 重排与质量分的混合是固定权重**：`0.6 × 相关性 + 0.4 × 质量`，且两者各自做 min-max 归一化——同一批结果内的相对排序才是它的语义，跨查询的绝对值不可比。权重不开放配置（避免多一个调错的旋钮）。
+- **L23 evidence 评分器的产出不进结果对象**：`WebSearchSource` 是封闭形状（D7），所以证据只落在诊断环与日志里。要把它送到模型面前，需在调用侧读 `recentDiagnostics()`，或由评分器自行改写 `snippet`。
+- **L24 7B 抽取的接口是预留而非内置**：仓库里没有任何本地模型代码，也不托管权重；`kind: 'evidence'` 只是一个形状约定 + 降级保证。要接真模型需另写插件调用 `registerScorer()`。

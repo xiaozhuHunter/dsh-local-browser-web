@@ -70,6 +70,10 @@ export const FIELD_GROUPS: readonly { readonly titleKey: PanelLocaleKey, readonl
       { path: ['dispatchMode'], kind: 'select', options: ['bail', 'parallel'], id: 'dispatchMode', labelKey: 'dispatchMode', hintKey: 'dispatchModeHint' },
       { path: ['parallelMaxEngines'], kind: 'number', id: 'parallelMaxEngines', labelKey: 'parallelMaxEngines', hintKey: 'parallelMaxEnginesHint' },
       { path: ['searchTimeoutMs'], kind: 'number', id: 'searchTimeoutMs', labelKey: 'searchTimeoutMs', hintKey: 'searchTimeoutMsHint' },
+      { path: ['searchScorer'], kind: 'text', id: 'searchScorer', labelKey: 'searchScorer', hintKey: 'searchScorerHint' },
+      { path: ['rerankEndpoint'], kind: 'text', id: 'rerankEndpoint', labelKey: 'rerankEndpoint', hintKey: 'rerankEndpointHint' },
+      { path: ['rerankModel'], kind: 'text', id: 'rerankModel', labelKey: 'rerankModel', hintKey: 'rerankModelHint' },
+      { path: ['rerankTimeoutMs'], kind: 'number', id: 'rerankTimeoutMs', labelKey: 'rerankTimeoutMs', hintKey: 'rerankTimeoutMsHint' },
     ],
   },
   {
@@ -82,6 +86,9 @@ export const FIELD_GROUPS: readonly { readonly titleKey: PanelLocaleKey, readonl
       { path: ['headless'], kind: 'boolean', id: 'headless', labelKey: 'headless', hintKey: 'headlessHint' },
       { path: ['profileMode'], kind: 'select', options: ['shared', 'isolated'], id: 'profileMode', labelKey: 'profileMode', hintKey: 'profileModeHint' },
       { path: ['fetchTimeoutMs'], kind: 'number', id: 'fetchTimeoutMs', labelKey: 'fetchTimeoutMs', hintKey: 'fetchTimeoutMsHint' },
+      { path: ['chromePath'], kind: 'text', id: 'chromePath', labelKey: 'chromePath', hintKey: 'chromePathHint' },
+      { path: ['chromeProfileDir'], kind: 'text', id: 'chromeProfileDir', labelKey: 'chromeProfileDir', hintKey: 'chromeProfileDirHint' },
+      { path: ['launchTimeoutMs'], kind: 'number', id: 'launchTimeoutMs', labelKey: 'launchTimeoutMs', hintKey: 'launchTimeoutMsHint' },
       { path: ['maxConcurrency'], kind: 'number', id: 'maxConcurrency', labelKey: 'maxConcurrency', hintKey: 'maxConcurrencyHint' },
       { path: ['maxResponseBytes'], kind: 'number', id: 'maxResponseBytes', labelKey: 'maxResponseBytes', hintKey: 'maxResponseBytesHint' },
       { path: ['maxBodyChars'], kind: 'number', id: 'maxBodyChars', labelKey: 'maxBodyChars', hintKey: 'maxBodyCharsHint' },
@@ -160,6 +167,30 @@ export interface EngineView {
 export interface CredentialState {
   configured: boolean
   writable: boolean
+}
+
+/** One browser-control verdict, mirrored from the host route's response. */
+export interface BrowserStatusView {
+  /** Whether the endpoint answered. */
+  ok: boolean
+  /** Whether Chrome is reachable on the configured port. */
+  running: boolean
+  /** The endpoint that was probed. */
+  endpoint: string
+  /** Browser string reported by CDP. */
+  browser?: string
+  /** Executable the launch resolved. */
+  chromePath?: string
+  /** Profile directory the launch used (or would use). */
+  profileDir: string
+  /** Whether this call spawned Chrome. */
+  launched: boolean
+  /** Machine-readable failure code. */
+  code?: string
+  /** Human-readable failure detail. */
+  message?: string
+  /** Candidate executables that were checked. */
+  searched: string[]
 }
 
 /** The whole panel's render state. */
@@ -586,6 +617,10 @@ export interface PanelActions {
   exportConfig(): Record<string, unknown>
   /** Stage an imported document as ordinary field edits. */
   importConfig(section: Record<string, unknown>): void
+  /** Probe the CDP endpoint without starting anything. */
+  browserStatus(): Promise<BrowserStatusView>
+  /** Probe, and start Chrome when the endpoint is absent. */
+  launchBrowser(): Promise<BrowserStatusView>
 }
 
 /**
@@ -602,11 +637,25 @@ export interface PanelFace extends PanelActions {
 }
 
 /**
+ * The carrier the panel uses for the host's browser-control route.
+ *
+ * Declared structurally so this module does not import the HTTP carrier: the
+ * panel only needs the two actions, and a test can pass a plain stub.
+ */
+export interface BrowserControlFace {
+  /** Probe the endpoint. */
+  status(): Promise<BrowserStatusView>
+  /** Probe, and start Chrome when absent. */
+  launch(): Promise<BrowserStatusView>
+}
+
+/**
  * Bind one form instance onto the face a slot registration injects.
  * @param form - the panel's staged form model.
+ * @param browser - the browser-control carrier.
  * @returns the face: snapshot hook plus every write action.
  */
-export function panelFace(form: PanelForm): PanelFace {
+export function panelFace(form: PanelForm, browser: BrowserControlFace): PanelFace {
   return {
     hooks: { localBrowserWeb: form.snapshot },
     editPath: (path, text) => { form.editPath(path, text) },
@@ -621,5 +670,7 @@ export function panelFace(form: PanelForm): PanelFace {
     stageSecret: (ref, text) => { form.stageSecret(ref, text) },
     exportConfig: () => form.exportSection(),
     importConfig: (section) => { form.stageImport(section) },
+    browserStatus: async () => await browser.status(),
+    launchBrowser: async () => await browser.launch(),
   }
 }

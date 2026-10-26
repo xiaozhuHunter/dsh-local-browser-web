@@ -54,6 +54,8 @@ interface DiagnosticsView {
   flags?: string[]
   code?: string
   message?: string
+  /** Claims a local evidence scorer extracted; unverified material, not a verdict. */
+  evidence?: readonly { claim: string, value?: string, sourceUrl: string }[]
 }
 
 /** Project a diagnostics record into its flat view. */
@@ -69,6 +71,7 @@ function toView(record: OperationRecord): DiagnosticsView {
     ...record.quality === undefined ? {} : { score: record.quality.score, flags: record.quality.flags },
     ...record.code === undefined ? {} : { code: record.code },
     ...record.message === undefined ? {} : { message: record.message },
+    ...record.evidence === undefined ? {} : { evidence: record.evidence },
   }
 }
 

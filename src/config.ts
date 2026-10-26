@@ -12,6 +12,7 @@
  */
 import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { isAbsolute } from 'node:path'
 import { LocalBrowserWebError } from './errors.ts'
 import { parseProxyUrl, type ProxyConfig } from './proxy.ts'
 import type {
@@ -267,6 +268,14 @@ export interface Config {
   engines: Volatile<EngineSpec[]>
   /** Per-engine search budget. */
   searchTimeoutMs: Volatile<number>
+  /** Id of the result scorer to run after quality ranking; empty = none. */
+  searchScorer: Volatile<string>
+  /** Endpoint of the built-in HTTP reranker. */
+  rerankEndpoint: Volatile<string>
+  /** Model id the reranker server knows. */
+  rerankModel: Volatile<string>
+  /** Reranker request budget. */
+  rerankTimeoutMs: Volatile<number>
   /** Which fetch provider the plugin registers: its own, or none (fallback to the upstream provider). */
   fetchProvider: Volatile<string>
   /** Which retrieval backend the fetch provider uses. */
@@ -281,6 +290,12 @@ export interface Config {
   profileMode: Volatile<ProfileMode>
   /** Per-fetch budget. */
   fetchTimeoutMs: Volatile<number>
+  /** Explicit Chrome executable for the panel's launch action; empty = auto-detect. */
+  chromePath: Volatile<string>
+  /** Data directory the panel's launch action uses; empty = plugin-owned default. */
+  chromeProfileDir: Volatile<string>
+  /** How long a launch waits for the CDP port to answer. */
+  launchTimeoutMs: Volatile<number>
   /** Upper bound on concurrent fetches. */
   maxConcurrency: Volatile<number>
   /** Response size cap, in bytes. */
@@ -344,6 +359,14 @@ export const Config = z.object({
     .comment('搜索引擎注册表'),
   searchTimeoutMs: z.number().step(1).min(1_000).max(120_000).default(20_000).volatile()
     .comment('单引擎搜索超时（毫秒）'),
+  searchScorer: z.string().default('').volatile()
+    .comment('结果评分器 id：空 = 不评分；rerank-http = 内置重排；其他值 = 第三方通过 registerScorer 注册的 id'),
+  rerankEndpoint: z.string().default('http://127.0.0.1:8080/rerank').volatile()
+    .comment('内置重排器的 HTTP 端点（TEI 的 /rerank 或 Cohere/Jina 风格均可）'),
+  rerankModel: z.string().default('BAAI/bge-reranker-v2-m3').volatile()
+    .comment('重排模型 id（由该端点识别）'),
+  rerankTimeoutMs: z.number().step(1).min(500).max(30_000).default(4_000).volatile()
+    .comment('重排请求超时（毫秒）；超时后保留原有排序，不影响结果完整性'),
 
   fetchProvider: z.string().default(LOCAL_FETCH_PROVIDER_ID).volatile()
     .comment('抓取 Provider：local-browser-fetch 注册本插件的本地抓取；其他值则不注册'),
@@ -357,6 +380,12 @@ export const Config = z.object({
     .comment('isolated 每次新建上下文 / shared 复用同一浏览器 profile（可带登录态）'),
   fetchTimeoutMs: z.number().step(1).min(1_000).max(120_000).default(45_000).volatile()
     .comment('单次抓取超时（毫秒）'),
+  chromePath: z.string().default('').volatile()
+    .comment('一键启动所用的 Chrome 可执行文件路径；留空自动检测常见安装位置'),
+  chromeProfileDir: z.string().default('').volatile()
+    .comment('一键启动所用的 Chrome 数据目录；留空使用插件自有目录（Chrome 136+ 不允许默认目录开调试端口）'),
+  launchTimeoutMs: z.number().step(1).min(3_000).max(60_000).default(15_000).volatile()
+    .comment('一键启动后等待调试端口响应的预算（毫秒）'),
   maxConcurrency: z.number().step(1).min(1).max(8).default(2).volatile()
     .comment('并发抓取上限'),
   maxResponseBytes: z.number().step(1).min(1_024).default(5_000_000).volatile()
@@ -383,6 +412,10 @@ export interface ResolvedConfig {
   parallelMaxEngines: number
   engines: EngineSpec[]
   searchTimeoutMs: number
+  searchScorer: string
+  rerankEndpoint: string
+  rerankModel: string
+  rerankTimeoutMs: number
   fetchProvider: string
   fetchBackend: FetchBackendId
   browserPath: string | undefined
@@ -390,6 +423,9 @@ export interface ResolvedConfig {
   headless: boolean
   profileMode: ProfileMode
   fetchTimeoutMs: number
+  chromePath: string
+  chromeProfileDir: string
+  launchTimeoutMs: number
   maxConcurrency: number
   maxResponseBytes: number
   maxBodyChars: number
@@ -438,6 +474,10 @@ export function readConfig(config: Config): ResolvedConfig {
     parallelMaxEngines: config.parallelMaxEngines.get(),
     engines: [...config.engines.get()],
     searchTimeoutMs: config.searchTimeoutMs.get(),
+    searchScorer: config.searchScorer.get(),
+    rerankEndpoint: config.rerankEndpoint.get(),
+    rerankModel: config.rerankModel.get(),
+    rerankTimeoutMs: config.rerankTimeoutMs.get(),
     fetchProvider: config.fetchProvider.get(),
     fetchBackend: config.fetchBackend.get(),
     browserPath: config.browserPath.get(),
@@ -445,6 +485,9 @@ export function readConfig(config: Config): ResolvedConfig {
     headless: config.headless.get(),
     profileMode: config.profileMode.get(),
     fetchTimeoutMs: config.fetchTimeoutMs.get(),
+    chromePath: config.chromePath.get(),
+    chromeProfileDir: config.chromeProfileDir.get(),
+    launchTimeoutMs: config.launchTimeoutMs.get(),
     maxConcurrency: config.maxConcurrency.get(),
     maxResponseBytes: config.maxResponseBytes.get(),
     maxBodyChars: config.maxBodyChars.get(),
@@ -549,6 +592,31 @@ export function validateConfig(resolved: ResolvedConfig, parsedIds: readonly str
   if (!Number.isFinite(resolved.fetchTimeoutMs) || resolved.fetchTimeoutMs <= 0) fail('fetchTimeoutMs 必须为正数')
   if (!Number.isFinite(resolved.searchTimeoutMs) || resolved.searchTimeoutMs <= 0) fail('searchTimeoutMs 必须为正数')
   if (!Number.isInteger(resolved.maxConcurrency) || resolved.maxConcurrency < 1) fail('maxConcurrency 必须为正整数')
+  if (!Number.isFinite(resolved.launchTimeoutMs) || resolved.launchTimeoutMs < 3_000) {
+    fail('launchTimeoutMs 必须不小于 3000')
+  }
+  if (resolved.searchScorer.trim() === 'rerank-http') {
+    let rerankUrl: URL | undefined
+    try {
+      rerankUrl = new URL(resolved.rerankEndpoint.trim())
+    } catch {
+      rerankUrl = undefined
+    }
+    if (rerankUrl === undefined) fail(`rerankEndpoint 不是合法 URL：${resolved.rerankEndpoint}`)
+    const protocol = rerankUrl?.protocol ?? ''
+    if (protocol !== 'http:' && protocol !== 'https:') {
+      fail(`rerankEndpoint 协议不支持：${protocol}`)
+    }
+    if (!Number.isFinite(resolved.rerankTimeoutMs) || resolved.rerankTimeoutMs < 500) {
+      fail('rerankTimeoutMs 必须不小于 500')
+    }
+  }
+  if (resolved.chromePath.trim().length > 0 && !isAbsolute(resolved.chromePath.trim())) {
+    fail('chromePath 必须是绝对路径')
+  }
+  if (resolved.chromeProfileDir.trim().length > 0 && !isAbsolute(resolved.chromeProfileDir.trim())) {
+    fail('chromeProfileDir 必须是绝对路径')
+  }
 
   if (resolved.proxy.enabled) {
     try {

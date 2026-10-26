@@ -15,6 +15,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { LogLevel } from './types.ts'
 import type { QualityVerdict } from './types.ts'
+import type { ScoreEvidence } from './search/scorers.ts'
 
 /** One completed (or failed) web operation. */
 export interface OperationRecord {
@@ -38,6 +39,8 @@ export interface OperationRecord {
   code?: string
   /** Failure message. */
   message?: string
+  /** Claims extracted by a local evidence scorer (a 7B extractor), not verified. */
+  evidence?: readonly ScoreEvidence[]
 }
 
 /** Log verbosity ordering: a record is emitted when its level is at or above the configured one. */
@@ -79,6 +82,7 @@ export class Diagnostics {
     const bits = [`kind=${record.kind}`, `via=${where}`, `ms=${String(Math.round(record.elapsedMs))}`]
     if (record.chars !== undefined) bits.push(`chars=${String(record.chars)}`)
     if (record.quality !== undefined) bits.push(`score=${String(record.quality.score)}`, `flags=${record.quality.flags.join(',') || '-'}`)
+    if (record.evidence !== undefined) bits.push(`evidence=${String(record.evidence.length)}`)
     if (record.code !== undefined) bits.push(`code=${record.code}`)
     const line = `local-browser-web ${bits.join(' ')} target=${record.target}`
     if (record.code !== undefined) this.logger?.warn(`${line} ${record.message ?? ''}`)
